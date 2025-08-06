@@ -21,6 +21,13 @@ EXPORT_FORMAT="json"
 GENERATE_HTML=true
 GENERATE_SUMMARY=true
 VENV_DIR=""
+INCLUDE_AWS_RESOURCES=false
+INCLUDE_CUSTOM_CRDS=false
+SPLIT_BY_TYPE=false
+GENERATE_RESTORE_SCRIPTS=false
+EXCLUDE_SECRETS_DATA=false
+NAMESPACE_FILTER=""
+RESOURCE_TYPE_FILTER=""
 
 # Function to print colored output
 print_info() {
@@ -55,6 +62,13 @@ Options:
   -k, --kubeconfig PATH        Path to kubeconfig file
   -f, --format FORMAT          Export format: json or yaml (default: json)
   -v, --venv VENV_DIR          Path to virtual environment directory
+  --include-aws-resources      Include AWS-specific resources (ENIConfigs, etc.)
+  --include-custom-crds        Include all custom resource instances
+  --split-by-type              Generate individual YAML files by resource type
+  --generate-restore-scripts   Generate restoration scripts and guides
+  --exclude-secrets-data       Exclude secret data values (metadata only)
+  --namespace-filter FILTER    Comma-separated list of namespaces to include
+  --resource-type FILTER       Comma-separated list of resource types
   --no-html                    Skip HTML dashboard generation
   --no-summary                 Skip summary report generation
   -h, --help                   Show this help message
@@ -63,14 +77,17 @@ Examples:
   # Basic export
   $0 -c my-eks-cluster
 
-  # Export with custom region and output directory
-  $0 -c my-eks-cluster -r us-west-2 -o /tmp/eks-export
+  # Export with AWS resources and custom CRDs
+  $0 -c my-eks-cluster --include-aws-resources --include-custom-crds
+
+  # Export for complete restoration
+  $0 -c my-eks-cluster --include-aws-resources --split-by-type --generate-restore-scripts
 
   # Export in YAML format without HTML dashboard
   $0 -c my-eks-cluster -f yaml --no-html
 
-  # Export using specific kubeconfig
-  $0 -c my-eks-cluster -k ~/.kube/my-cluster-config
+  # Export specific namespaces only
+  $0 -c my-eks-cluster --namespace-filter=default,kube-system
 
   # Export using virtual environment
   $0 -c my-eks-cluster -v /path/to/venv
@@ -202,6 +219,37 @@ export_cluster_config() {
         EXPORT_CMD="$EXPORT_CMD --summary"
     fi
     
+    # Add enhanced export options
+    if [ "$INCLUDE_AWS_RESOURCES" = true ]; then
+        EXPORT_CMD="$EXPORT_CMD --include-aws-resources"
+    fi
+    
+    if [ "$INCLUDE_CUSTOM_CRDS" = true ]; then
+        EXPORT_CMD="$EXPORT_CMD --include-custom-crds"
+    fi
+    
+    if [ "$SPLIT_BY_TYPE" = true ]; then
+        EXPORT_CMD="$EXPORT_CMD --split-by-type"
+    fi
+    
+    if [ "$GENERATE_RESTORE_SCRIPTS" = true ]; then
+        EXPORT_CMD="$EXPORT_CMD --generate-restore-scripts"
+    fi
+    
+    if [ "$EXCLUDE_SECRETS_DATA" = true ]; then
+        EXPORT_CMD="$EXPORT_CMD --exclude-secrets-data"
+    fi
+    
+    if [ -n "$NAMESPACE_FILTER" ]; then
+        EXPORT_CMD="$EXPORT_CMD --namespace-filter $NAMESPACE_FILTER"
+    fi
+    
+    if [ -n "$RESOURCE_TYPE_FILTER" ]; then
+        EXPORT_CMD="$EXPORT_CMD --resource-type $RESOURCE_TYPE_FILTER"
+    fi
+    
+    EXPORT_CMD="$EXPORT_CMD --output-dir $OUTPUT_DIR"
+    
     # Execute export
     if eval "$EXPORT_CMD"; then
         print_success "Configuration exported to: $EXPORT_FILE"
@@ -258,6 +306,24 @@ show_export_summary() {
     echo "  Region: ${REGION:-$(aws configure get region)}"
     echo "  Output Directory: $OUTPUT_DIR"
     echo "  Format: $EXPORT_FORMAT"
+    
+    # Show enhanced options used
+    if [ "$INCLUDE_AWS_RESOURCES" = true ]; then
+        echo "  AWS Resources: Included"
+    fi
+    
+    if [ "$INCLUDE_CUSTOM_CRDS" = true ]; then
+        echo "  Custom CRDs: Included"
+    fi
+    
+    if [ "$SPLIT_BY_TYPE" = true ]; then
+        echo "  YAML Split: Enabled"
+    fi
+    
+    if [ "$GENERATE_RESTORE_SCRIPTS" = true ]; then
+        echo "  Restore Scripts: Generated"
+    fi
+    
     echo
     
     if [ -f "$OUTPUT_DIR/.last_export" ]; then
@@ -277,8 +343,26 @@ show_export_summary() {
     echo "  2. Open the HTML dashboard in your web browser"
     echo "  3. Use the dashboard to explore your cluster configuration"
     
-    if [ -f "$OUTPUT_DIR"/*summary*.txt ]; then
+    if ls "$OUTPUT_DIR"/*summary*.txt >/dev/null 2>&1; then
         echo "  4. Check the summary report for quick insights"
+    fi
+    
+    # Check for kubectl restore directory
+    if ls "$OUTPUT_DIR"/kubectl-restore-* >/dev/null 2>&1; then
+        RESTORE_DIR=$(ls -d "$OUTPUT_DIR"/kubectl-restore-* | head -1)
+        echo "  5. For cluster restoration, see: $RESTORE_DIR"
+        echo "     cd \"$RESTORE_DIR\" && ./restore-cluster.sh --validate-dependencies"
+    fi
+    
+    # Show if AWS/CNI resources were found
+    if [ "$INCLUDE_AWS_RESOURCES" = true ]; then
+        echo ""
+        print_info "Enhanced Features:"
+        echo "  ✅ AWS VPC CNI resources (ENIConfigs, SecurityGroupPolicies)"
+        echo "  ✅ Multus CNI resources (NetworkAttachmentDefinitions)"
+        echo "  ✅ Karpenter resources (NodePools, NodeClasses, NodeClaims)"
+        echo "  ✅ Dynamic custom resource discovery"
+        echo "  ✅ Multi-interface pod configuration support"
     fi
 }
 
@@ -307,6 +391,34 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--venv)
             VENV_DIR="$2"
+            shift 2
+            ;;
+        --include-aws-resources)
+            INCLUDE_AWS_RESOURCES=true
+            shift
+            ;;
+        --include-custom-crds)
+            INCLUDE_CUSTOM_CRDS=true
+            shift
+            ;;
+        --split-by-type)
+            SPLIT_BY_TYPE=true
+            shift
+            ;;
+        --generate-restore-scripts)
+            GENERATE_RESTORE_SCRIPTS=true
+            shift
+            ;;
+        --exclude-secrets-data)
+            EXCLUDE_SECRETS_DATA=true
+            shift
+            ;;
+        --namespace-filter)
+            NAMESPACE_FILTER="$2"
+            shift 2
+            ;;
+        --resource-type)
+            RESOURCE_TYPE_FILTER="$2"
             shift 2
             ;;
         --no-html)

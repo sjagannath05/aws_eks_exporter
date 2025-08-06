@@ -12,6 +12,7 @@ import boto3
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 import logging
+from pathlib import Path
 
 class EKSConfigExporter:
     """
@@ -82,6 +83,7 @@ class EKSConfigExporter:
                 'core_v1': client.CoreV1Api(),
                 'apps_v1': client.AppsV1Api(),
                 'networking_v1': client.NetworkingV1Api(),
+                'discovery_v1': client.DiscoveryV1Api(),
                 'rbac_v1': client.RbacAuthorizationV1Api(),
                 'storage_v1': client.StorageV1Api(),
                 'batch_v1': client.BatchV1Api(),
@@ -597,7 +599,7 @@ class EKSConfigExporter:
     def export_endpoint_slices(self):
         """Export all endpoint slices."""
         try:
-            endpoint_slices = self.k8s_client['networking_v1'].list_endpoint_slice_for_all_namespaces()
+            endpoint_slices = self.k8s_client['discovery_v1'].list_endpoint_slice_for_all_namespaces()
             self.export_data['resources']['endpoint_slices'] = []
             
             for es in endpoint_slices.items:
@@ -1182,6 +1184,260 @@ class EKSConfigExporter:
         except ApiException as e:
             self.logger.error(f"Failed to export custom resource definitions: {e}")
     
+    def export_eni_configs(self):
+        """Export AWS VPC CNI ENIConfigs."""
+        try:
+            eni_configs = self.k8s_client['custom_objects'].list_cluster_custom_object(
+                group='crd.k8s.amazonaws.com',
+                version='v1alpha1',
+                plural='eniconfigs'
+            )
+            self.export_data['resources']['eni_configs'] = []
+            
+            for eni_config in eni_configs.get('items', []):
+                eni_info = {
+                    'name': eni_config.get('metadata', {}).get('name', 'N/A'),
+                    'labels': eni_config.get('metadata', {}).get('labels', {}),
+                    'annotations': eni_config.get('metadata', {}).get('annotations', {}),
+                    'spec': eni_config.get('spec', {}),
+                    'creation_timestamp': eni_config.get('metadata', {}).get('creationTimestamp'),
+                    'full_config': eni_config
+                }
+                self.export_data['resources']['eni_configs'].append(eni_info)
+                
+        except Exception as e:
+            self.logger.warning(f"ENIConfigs not found or accessible: {e}")
+            self.export_data['resources']['eni_configs'] = []
+    
+    def export_security_group_policies(self):
+        """Export AWS VPC CNI SecurityGroupPolicies."""
+        try:
+            sg_policies = self.k8s_client['custom_objects'].list_namespaced_custom_object(
+                group='vpcresources.k8s.aws',
+                version='v1beta1', 
+                namespace='',
+                plural='securitygrouppolicies'
+            )
+            self.export_data['resources']['security_group_policies'] = []
+            
+            for sg_policy in sg_policies.get('items', []):
+                sg_info = {
+                    'name': sg_policy.get('metadata', {}).get('name', 'N/A'),
+                    'namespace': sg_policy.get('metadata', {}).get('namespace', 'N/A'),
+                    'labels': sg_policy.get('metadata', {}).get('labels', {}),
+                    'annotations': sg_policy.get('metadata', {}).get('annotations', {}),
+                    'spec': sg_policy.get('spec', {}),
+                    'status': sg_policy.get('status', {}),
+                    'creation_timestamp': sg_policy.get('metadata', {}).get('creationTimestamp'),
+                    'full_config': sg_policy
+                }
+                self.export_data['resources']['security_group_policies'].append(sg_info)
+                
+        except Exception as e:
+            self.logger.warning(f"SecurityGroupPolicies not found or accessible: {e}")
+            self.export_data['resources']['security_group_policies'] = []
+    
+    def export_cni_nodes(self):
+        """Export AWS VPC CNI CNINodes."""
+        try:
+            cni_nodes = self.k8s_client['custom_objects'].list_cluster_custom_object(
+                group='vpcresources.k8s.aws',
+                version='v1alpha1',
+                plural='cninodes'
+            )
+            self.export_data['resources']['cni_nodes'] = []
+            
+            for cni_node in cni_nodes.get('items', []):
+                cni_info = {
+                    'name': cni_node.get('metadata', {}).get('name', 'N/A'),
+                    'labels': cni_node.get('metadata', {}).get('labels', {}),
+                    'annotations': cni_node.get('metadata', {}).get('annotations', {}),
+                    'spec': cni_node.get('spec', {}),
+                    'status': cni_node.get('status', {}),
+                    'creation_timestamp': cni_node.get('metadata', {}).get('creationTimestamp'),
+                    'full_config': cni_node
+                }
+                self.export_data['resources']['cni_nodes'].append(cni_info)
+                
+        except Exception as e:
+            self.logger.warning(f"CNINodes not found or accessible: {e}")
+            self.export_data['resources']['cni_nodes'] = []
+    
+    def export_network_attachment_definitions(self):
+        """Export Multus CNI NetworkAttachmentDefinitions."""
+        try:
+            net_attachments = self.k8s_client['custom_objects'].list_namespaced_custom_object(
+                group='k8s.cni.cncf.io',
+                version='v1',
+                namespace='',
+                plural='network-attachment-definitions'
+            )
+            self.export_data['resources']['network_attachment_definitions'] = []
+            
+            for net_attach in net_attachments.get('items', []):
+                net_info = {
+                    'name': net_attach.get('metadata', {}).get('name', 'N/A'),
+                    'namespace': net_attach.get('metadata', {}).get('namespace', 'N/A'),
+                    'labels': net_attach.get('metadata', {}).get('labels', {}),
+                    'annotations': net_attach.get('metadata', {}).get('annotations', {}),
+                    'spec': net_attach.get('spec', {}),
+                    'creation_timestamp': net_attach.get('metadata', {}).get('creationTimestamp'),
+                    'full_config': net_attach
+                }
+                self.export_data['resources']['network_attachment_definitions'].append(net_info)
+                
+        except Exception as e:
+            self.logger.warning(f"NetworkAttachmentDefinitions not found or accessible: {e}")
+            self.export_data['resources']['network_attachment_definitions'] = []
+    
+    def export_karpenter_nodepools(self):
+        """Export Karpenter NodePools."""
+        try:
+            nodepools = self.k8s_client['custom_objects'].list_cluster_custom_object(
+                group='karpenter.sh',
+                version='v1',
+                plural='nodepools'
+            )
+            self.export_data['resources']['karpenter_nodepools'] = []
+            
+            for nodepool in nodepools.get('items', []):
+                np_info = {
+                    'name': nodepool.get('metadata', {}).get('name', 'N/A'),
+                    'labels': nodepool.get('metadata', {}).get('labels', {}),
+                    'annotations': nodepool.get('metadata', {}).get('annotations', {}),
+                    'spec': nodepool.get('spec', {}),
+                    'status': nodepool.get('status', {}),
+                    'creation_timestamp': nodepool.get('metadata', {}).get('creationTimestamp'),
+                    'full_config': nodepool
+                }
+                self.export_data['resources']['karpenter_nodepools'].append(np_info)
+                
+        except Exception as e:
+            self.logger.warning(f"Karpenter NodePools not found or accessible: {e}")
+            self.export_data['resources']['karpenter_nodepools'] = []
+    
+    def export_karpenter_nodeclasses(self):
+        """Export Karpenter NodeClasses."""
+        try:
+            # Try EKS-specific NodeClasses first
+            try:
+                nodeclasses = self.k8s_client['custom_objects'].list_cluster_custom_object(
+                    group='karpenter.k8s.aws',
+                    version='v1',
+                    plural='ec2nodeclasses'
+                )
+                nodeclass_type = 'ec2nodeclasses'
+            except:
+                # Fallback to generic NodeClasses
+                nodeclasses = self.k8s_client['custom_objects'].list_cluster_custom_object(
+                    group='karpenter.sh',
+                    version='v1',
+                    plural='nodeclasses'
+                )
+                nodeclass_type = 'nodeclasses'
+            
+            self.export_data['resources']['karpenter_nodeclasses'] = []
+            
+            for nodeclass in nodeclasses.get('items', []):
+                nc_info = {
+                    'name': nodeclass.get('metadata', {}).get('name', 'N/A'),
+                    'type': nodeclass_type,
+                    'labels': nodeclass.get('metadata', {}).get('labels', {}),
+                    'annotations': nodeclass.get('metadata', {}).get('annotations', {}),
+                    'spec': nodeclass.get('spec', {}),
+                    'status': nodeclass.get('status', {}),
+                    'creation_timestamp': nodeclass.get('metadata', {}).get('creationTimestamp'),
+                    'full_config': nodeclass
+                }
+                self.export_data['resources']['karpenter_nodeclasses'].append(nc_info)
+                
+        except Exception as e:
+            self.logger.warning(f"Karpenter NodeClasses not found or accessible: {e}")
+            self.export_data['resources']['karpenter_nodeclasses'] = []
+    
+    def export_karpenter_nodeclaims(self):
+        """Export Karpenter NodeClaims."""
+        try:
+            nodeclaims = self.k8s_client['custom_objects'].list_cluster_custom_object(
+                group='karpenter.sh',
+                version='v1',
+                plural='nodeclaims'
+            )
+            self.export_data['resources']['karpenter_nodeclaims'] = []
+            
+            for nodeclaim in nodeclaims.get('items', []):
+                nc_info = {
+                    'name': nodeclaim.get('metadata', {}).get('name', 'N/A'),
+                    'labels': nodeclaim.get('metadata', {}).get('labels', {}),
+                    'annotations': nodeclaim.get('metadata', {}).get('annotations', {}),
+                    'spec': nodeclaim.get('spec', {}),
+                    'status': nodeclaim.get('status', {}),
+                    'creation_timestamp': nodeclaim.get('metadata', {}).get('creationTimestamp'),
+                    'full_config': nodeclaim
+                }
+                self.export_data['resources']['karpenter_nodeclaims'].append(nc_info)
+                
+        except Exception as e:
+            self.logger.warning(f"Karpenter NodeClaims not found or accessible: {e}")
+            self.export_data['resources']['karpenter_nodeclaims'] = []
+    
+    def export_custom_resources_dynamically(self):
+        """Dynamically discover and export custom resources."""
+        try:
+            crds = self.k8s_client['apiextensions_v1'].list_custom_resource_definition()
+            
+            # Track additional custom resources not covered by specific methods
+            aws_resources = ['eniconfigs', 'securitygrouppolicies', 'cninodes']
+            cni_resources = ['network-attachment-definitions']
+            karpenter_resources = ['nodepools', 'ec2nodeclasses', 'nodeclasses', 'nodeclaims']
+            covered_resources = aws_resources + cni_resources + karpenter_resources
+            
+            self.export_data['resources']['additional_custom_resources'] = {}
+            
+            for crd in crds.items:
+                plural_name = crd.spec.names.plural
+                group = crd.spec.group
+                
+                # Skip resources we already handle specifically
+                if plural_name in covered_resources:
+                    continue
+                    
+                # Export instances of this CRD
+                try:
+                    for version in crd.spec.versions:
+                        if version.served:
+                            if crd.spec.scope == 'Namespaced':
+                                custom_resources = self.k8s_client['custom_objects'].list_namespaced_custom_object(
+                                    group=group,
+                                    version=version.name,
+                                    namespace='',
+                                    plural=plural_name
+                                )
+                            else:
+                                custom_resources = self.k8s_client['custom_objects'].list_cluster_custom_object(
+                                    group=group,
+                                    version=version.name,
+                                    plural=plural_name
+                                )
+                            
+                            resource_key = f"{group}_{plural_name}"
+                            self.export_data['resources']['additional_custom_resources'][resource_key] = {
+                                'crd_info': {
+                                    'group': group,
+                                    'version': version.name,
+                                    'plural': plural_name,
+                                    'scope': crd.spec.scope
+                                },
+                                'instances': custom_resources.get('items', [])
+                            }
+                            break  # Use first served version
+                except Exception as e:
+                    self.logger.debug(f"Could not export custom resource {plural_name}: {e}")
+                    
+        except Exception as e:
+            self.logger.warning(f"Failed to dynamically discover custom resources: {e}")
+            self.export_data['resources']['additional_custom_resources'] = {}
+    
     def export_mutating_webhook_configurations(self):
         """Export all mutating webhook configurations."""
         try:
@@ -1393,6 +1649,14 @@ class EKSConfigExporter:
             ('network_policies', self.export_network_policies),
             ('pod_disruption_budgets', self.export_pod_disruption_budgets),
             ('custom_resource_definitions', self.export_custom_resource_definitions),
+            ('eni_configs', self.export_eni_configs),
+            ('security_group_policies', self.export_security_group_policies),
+            ('cni_nodes', self.export_cni_nodes),
+            ('network_attachment_definitions', self.export_network_attachment_definitions),
+            ('karpenter_nodepools', self.export_karpenter_nodepools),
+            ('karpenter_nodeclasses', self.export_karpenter_nodeclasses),
+            ('karpenter_nodeclaims', self.export_karpenter_nodeclaims),
+            ('additional_custom_resources', self.export_custom_resources_dynamically),
             ('mutating_webhook_configurations', self.export_mutating_webhook_configurations),
             ('validating_webhook_configurations', self.export_validating_webhook_configurations),
             ('api_services', self.export_api_services),
@@ -1428,6 +1692,480 @@ class EKSConfigExporter:
         
         self.logger.info(f"Export saved to {output_file}")
     
+    def save_kubernetes_yaml_resources(self, output_dir: str):
+        """Save resources as individual Kubernetes YAML files for restoration."""
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create directory structure
+        dirs = {
+            'infrastructure': output_path / 'infrastructure',
+            'networking': output_path / 'networking', 
+            'workloads': output_path / 'workloads',
+            'storage': output_path / 'storage',
+            'rbac': output_path / 'rbac',
+            'config': output_path / 'config',
+            'custom-resources': output_path / 'custom-resources'
+        }
+        
+        for dir_path in dirs.values():
+            dir_path.mkdir(exist_ok=True)
+        
+        resources = self.export_data.get('resources', {})
+        
+        # Infrastructure resources
+        self._save_yaml_resource_type(dirs['infrastructure'] / 'nodes.yaml', 'nodes', resources)
+        self._save_yaml_resource_type(dirs['infrastructure'] / 'karpenter-nodepools.yaml', 'karpenter_nodepools', resources)
+        self._save_yaml_resource_type(dirs['infrastructure'] / 'karpenter-nodeclasses.yaml', 'karpenter_nodeclasses', resources)
+        self._save_yaml_resource_type(dirs['infrastructure'] / 'karpenter-nodeclaims.yaml', 'karpenter_nodeclaims', resources)
+        
+        # Networking resources
+        self._save_yaml_resource_type(dirs['networking'] / 'services.yaml', 'services', resources)
+        self._save_yaml_resource_type(dirs['networking'] / 'ingresses.yaml', 'ingresses', resources)
+        self._save_yaml_resource_type(dirs['networking'] / 'network-policies.yaml', 'network_policies', resources)
+        self._save_yaml_resource_type(dirs['networking'] / 'network-attachment-definitions.yaml', 'network_attachment_definitions', resources)
+        self._save_yaml_resource_type(dirs['networking'] / 'eniconfigs.yaml', 'eni_configs', resources)
+        self._save_yaml_resource_type(dirs['networking'] / 'security-group-policies.yaml', 'security_group_policies', resources)
+        self._save_yaml_resource_type(dirs['networking'] / 'cni-nodes.yaml', 'cni_nodes', resources)
+        
+        # Workload resources
+        self._save_yaml_resource_type(dirs['workloads'] / 'deployments.yaml', 'deployments', resources)
+        self._save_yaml_resource_type(dirs['workloads'] / 'daemonsets.yaml', 'daemonsets', resources)
+        self._save_yaml_resource_type(dirs['workloads'] / 'statefulsets.yaml', 'statefulsets', resources)
+        self._save_yaml_resource_type(dirs['workloads'] / 'jobs.yaml', 'jobs', resources)
+        self._save_yaml_resource_type(dirs['workloads'] / 'cronjobs.yaml', 'cronjobs', resources)
+        self._save_yaml_resource_type(dirs['workloads'] / 'pods.yaml', 'pods', resources)
+        
+        # Storage resources
+        self._save_yaml_resource_type(dirs['storage'] / 'persistent-volumes.yaml', 'persistent_volumes', resources)
+        self._save_yaml_resource_type(dirs['storage'] / 'persistent-volume-claims.yaml', 'persistent_volume_claims', resources)
+        self._save_yaml_resource_type(dirs['storage'] / 'storage-classes.yaml', 'storage_classes', resources)
+        
+        # RBAC resources
+        self._save_yaml_resource_type(dirs['rbac'] / 'service-accounts.yaml', 'service_accounts', resources)
+        self._save_yaml_resource_type(dirs['rbac'] / 'cluster-roles.yaml', 'cluster_roles', resources)
+        self._save_yaml_resource_type(dirs['rbac'] / 'cluster-role-bindings.yaml', 'cluster_role_bindings', resources)
+        self._save_yaml_resource_type(dirs['rbac'] / 'roles.yaml', 'roles', resources)
+        self._save_yaml_resource_type(dirs['rbac'] / 'role-bindings.yaml', 'role_bindings', resources)
+        
+        # Config resources
+        self._save_yaml_resource_type(dirs['config'] / 'namespaces.yaml', 'namespaces', resources)
+        self._save_yaml_resource_type(dirs['config'] / 'configmaps.yaml', 'configmaps', resources)
+        self._save_yaml_resource_type(dirs['config'] / 'secrets.yaml', 'secrets', resources)
+        
+        # Custom resources
+        self._save_yaml_resource_type(dirs['custom-resources'] / 'custom-resource-definitions.yaml', 'custom_resource_definitions', resources)
+        self._save_additional_custom_resources(dirs['custom-resources'], resources)
+        
+        # Generate restoration guide
+        self._generate_restoration_guide(output_path / 'restore-guide.md')
+        
+        # Generate restoration script
+        self._generate_restoration_script(output_path / 'restore-cluster.sh')
+        
+        self.logger.info(f"Kubernetes YAML resources saved to {output_dir}")
+    
+    def _save_yaml_resource_type(self, file_path: Path, resource_type: str, resources: dict):
+        """Save a specific resource type as YAML."""
+        resource_list = resources.get(resource_type, [])
+        
+        if not resource_list:
+            return
+            
+        yaml_docs = []
+        
+        for resource in resource_list:
+            # Convert to Kubernetes API format
+            if 'full_config' in resource:
+                yaml_docs.append(resource['full_config'])
+            else:
+                # Reconstruct basic Kubernetes resource format
+                k8s_resource = self._convert_to_kubernetes_format(resource, resource_type)
+                if k8s_resource:
+                    yaml_docs.append(k8s_resource)
+        
+        if yaml_docs:
+            with open(file_path, 'w') as f:
+                for i, doc in enumerate(yaml_docs):
+                    if i > 0:
+                        f.write('---\n')
+                    yaml.dump(doc, f, default_flow_style=False)
+    
+    def _save_additional_custom_resources(self, custom_dir: Path, resources: dict):
+        """Save additional custom resources."""
+        additional_crs = resources.get('additional_custom_resources', {})
+        
+        for resource_key, resource_data in additional_crs.items():
+            instances = resource_data.get('instances', [])
+            if instances:
+                file_path = custom_dir / f"{resource_key}.yaml"
+                with open(file_path, 'w') as f:
+                    for i, instance in enumerate(instances):
+                        if i > 0:
+                            f.write('---\n')
+                        yaml.dump(instance, f, default_flow_style=False)
+    
+    def _convert_to_kubernetes_format(self, resource: dict, resource_type: str) -> dict:
+        """Convert exported resource back to Kubernetes API format."""
+        # This is a simplified conversion - in a real implementation,
+        # you'd need more sophisticated mapping for each resource type
+        
+        api_versions = {
+            'pods': 'v1',
+            'services': 'v1', 
+            'deployments': 'apps/v1',
+            'daemonsets': 'apps/v1',
+            'statefulsets': 'apps/v1',
+            'configmaps': 'v1',
+            'secrets': 'v1',
+            'namespaces': 'v1',
+            'nodes': 'v1',
+            'persistent_volumes': 'v1',
+            'persistent_volume_claims': 'v1',
+            'storage_classes': 'storage.k8s.io/v1',
+            'service_accounts': 'v1',
+            'cluster_roles': 'rbac.authorization.k8s.io/v1',
+            'cluster_role_bindings': 'rbac.authorization.k8s.io/v1',
+            'roles': 'rbac.authorization.k8s.io/v1',
+            'role_bindings': 'rbac.authorization.k8s.io/v1',
+        }
+        
+        kinds = {
+            'pods': 'Pod',
+            'services': 'Service',
+            'deployments': 'Deployment',
+            'daemonsets': 'DaemonSet',
+            'statefulsets': 'StatefulSet',
+            'configmaps': 'ConfigMap',
+            'secrets': 'Secret',
+            'namespaces': 'Namespace',
+            'nodes': 'Node',
+            'persistent_volumes': 'PersistentVolume',
+            'persistent_volume_claims': 'PersistentVolumeClaim',
+            'storage_classes': 'StorageClass',
+            'service_accounts': 'ServiceAccount',
+            'cluster_roles': 'ClusterRole',
+            'cluster_role_bindings': 'ClusterRoleBinding',
+            'roles': 'Role',
+            'role_bindings': 'RoleBinding',
+        }
+        
+        if resource_type not in api_versions:
+            return None
+            
+        k8s_resource = {
+            'apiVersion': api_versions[resource_type],
+            'kind': kinds[resource_type],
+            'metadata': {
+                'name': resource.get('name', ''),
+                'labels': resource.get('labels', {}),
+                'annotations': resource.get('annotations', {})
+            }
+        }
+        
+        if 'namespace' in resource and resource['namespace']:
+            k8s_resource['metadata']['namespace'] = resource['namespace']
+            
+        return k8s_resource
+    
+    def _generate_restoration_guide(self, file_path: Path):
+        """Generate a restoration guide."""
+        guide_content = f"""
+# EKS Cluster Restoration Guide
+
+## Overview
+This guide provides step-by-step instructions to restore your EKS cluster configuration from the exported YAML files.
+
+## Prerequisites
+- kubectl configured for target cluster
+- Appropriate RBAC permissions
+- Custom Resource Definitions (CRDs) installed if needed
+
+## Restoration Order
+
+### 1. Infrastructure Resources
+```bash
+# Apply CRDs first
+kubectl apply -f custom-resources/custom-resource-definitions.yaml
+
+# Wait for CRDs to be ready
+kubectl wait --for condition=established --timeout=60s crd --all
+
+# Apply infrastructure resources
+kubectl apply -f infrastructure/
+```
+
+### 2. Configuration Resources
+```bash
+# Apply namespaces first
+kubectl apply -f config/namespaces.yaml
+
+# Apply other config resources
+kubectl apply -f config/configmaps.yaml
+kubectl apply -f config/secrets.yaml
+```
+
+### 3. RBAC Resources
+```bash
+kubectl apply -f rbac/
+```
+
+### 4. Storage Resources
+```bash
+kubectl apply -f storage/
+```
+
+### 5. Networking Resources
+```bash
+# Apply ENI configs and networking policies
+kubectl apply -f networking/eniconfigs.yaml
+kubectl apply -f networking/network-attachment-definitions.yaml
+kubectl apply -f networking/cni-nodes.yaml
+kubectl apply -f networking/security-group-policies.yaml
+
+# Apply services and ingresses
+kubectl apply -f networking/services.yaml
+kubectl apply -f networking/ingresses.yaml
+kubectl apply -f networking/network-policies.yaml
+```
+
+### 6. Workload Resources
+```bash
+# Apply workloads (order matters for some resources)
+kubectl apply -f workloads/deployments.yaml
+kubectl apply -f workloads/daemonsets.yaml
+kubectl apply -f workloads/statefulsets.yaml
+kubectl apply -f workloads/jobs.yaml
+kubectl apply -f workloads/cronjobs.yaml
+```
+
+### 7. Custom Resources
+```bash
+# Apply additional custom resources
+kubectl apply -f custom-resources/
+```
+
+## Verification
+
+### Check cluster status
+```bash
+kubectl get nodes
+kubectl get pods --all-namespaces
+kubectl get services --all-namespaces
+```
+
+### Verify custom resources
+```bash
+# Check ENIConfigs
+kubectl get eniconfigs
+
+# Check NetworkAttachmentDefinitions 
+kubectl get network-attachment-definitions --all-namespaces
+
+# Check Karpenter resources
+kubectl get nodepools
+kubectl get ec2nodeclasses
+```
+
+### Check multi-interface pod configurations
+```bash
+# Verify pods with network annotations
+kubectl get pods -o jsonpath='{{range .items[*]}}{{.metadata.name}}{{"\\t"}}{{.metadata.annotations.k8s\\.v1\\.cni\\.cncf\\.io/networks}}{{"\\n"}}{{end}}'
+```
+
+## Troubleshooting
+
+- If CRDs fail to apply, check if they already exist
+- If pods fail to start, check for missing dependencies
+- For networking issues, verify CNI plugins are installed
+- Check AWS VPC CNI and Multus CNI configurations
+
+## Generated on
+{self.export_data['metadata']['export_timestamp']}
+Cluster: {self.cluster_name}
+Region: {self.region}
+"""
+        
+        with open(file_path, 'w') as f:
+            f.write(guide_content)
+    
+    def _generate_restoration_script(self, file_path: Path):
+        """Generate an automated restoration script."""
+        script_content = '''
+#!/bin/bash
+
+# EKS Cluster Restoration Script
+# This script automatically applies resources in the correct order
+
+set -e
+
+# Colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+print_info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Parse command line arguments
+DRY_RUN=false
+VALIDATE=false
+NAMESPACE_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --validate-dependencies)
+            VALIDATE=true
+            shift
+            ;;
+        --namespace)
+            NAMESPACE_FILTER="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS]"
+            echo "Options:"
+            echo "  --dry-run                 Show what would be applied without actually applying"
+            echo "  --validate-dependencies   Validate prerequisites before applying"
+            echo "  --namespace NAMESPACE     Only apply resources in specified namespace"
+            echo "  -h, --help               Show this help message"
+            exit 0
+            ;;
+        *)
+            print_error "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Function to apply resources
+apply_resources() {
+    local file=$1
+    local description=$2
+    
+    if [ ! -f "$file" ]; then
+        print_info "$file not found, skipping $description"
+        return
+    fi
+    
+    print_info "Applying $description..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        kubectl apply -f "$file" --dry-run=client
+    else
+        kubectl apply -f "$file"
+    fi
+    
+    print_success "$description applied successfully"
+}
+
+# Function to wait for resources
+wait_for_resources() {
+    local resource_type=$1
+    local timeout=${2:-60}
+    
+    print_info "Waiting for $resource_type to be ready..."
+    if kubectl wait --for=condition=established --timeout="${timeout}s" "$resource_type" --all 2>/dev/null; then
+        print_success "$resource_type are ready"
+    else
+        print_error "Timeout waiting for $resource_type"
+    fi
+}
+
+# Validation
+if [ "$VALIDATE" = true ]; then
+    print_info "Validating prerequisites..."
+    
+    if ! command -v kubectl &> /dev/null; then
+        print_error "kubectl is required but not installed"
+        exit 1
+    fi
+    
+    if ! kubectl cluster-info &> /dev/null; then
+        print_error "Cannot connect to Kubernetes cluster"
+        exit 1
+    fi
+    
+    print_success "Prerequisites validated"
+fi
+
+print_info "Starting EKS cluster restoration..."
+
+# Step 1: Apply CRDs
+apply_resources "custom-resources/custom-resource-definitions.yaml" "Custom Resource Definitions"
+wait_for_resources "crd"
+
+# Step 2: Apply namespaces
+apply_resources "config/namespaces.yaml" "Namespaces"
+
+# Step 3: Apply infrastructure
+apply_resources "infrastructure/karpenter-nodeclasses.yaml" "Karpenter NodeClasses" 
+apply_resources "infrastructure/karpenter-nodepools.yaml" "Karpenter NodePools"
+apply_resources "infrastructure/karpenter-nodeclaims.yaml" "Karpenter NodeClaims"
+
+# Step 4: Apply RBAC
+apply_resources "rbac/service-accounts.yaml" "Service Accounts"
+apply_resources "rbac/cluster-roles.yaml" "Cluster Roles"
+apply_resources "rbac/cluster-role-bindings.yaml" "Cluster Role Bindings"
+apply_resources "rbac/roles.yaml" "Roles"
+apply_resources "rbac/role-bindings.yaml" "Role Bindings"
+
+# Step 5: Apply config
+apply_resources "config/configmaps.yaml" "ConfigMaps"
+apply_resources "config/secrets.yaml" "Secrets"
+
+# Step 6: Apply storage
+apply_resources "storage/storage-classes.yaml" "Storage Classes"
+apply_resources "storage/persistent-volumes.yaml" "Persistent Volumes"
+apply_resources "storage/persistent-volume-claims.yaml" "Persistent Volume Claims"
+
+# Step 7: Apply networking (critical for multi-interface pods)
+apply_resources "networking/eniconfigs.yaml" "ENI Configs"
+apply_resources "networking/network-attachment-definitions.yaml" "Network Attachment Definitions"
+apply_resources "networking/cni-nodes.yaml" "CNI Nodes"
+apply_resources "networking/security-group-policies.yaml" "Security Group Policies"
+apply_resources "networking/services.yaml" "Services"
+apply_resources "networking/ingresses.yaml" "Ingresses"
+apply_resources "networking/network-policies.yaml" "Network Policies"
+
+# Step 8: Apply workloads
+apply_resources "workloads/deployments.yaml" "Deployments"
+apply_resources "workloads/daemonsets.yaml" "DaemonSets"
+apply_resources "workloads/statefulsets.yaml" "StatefulSets"
+apply_resources "workloads/jobs.yaml" "Jobs"
+apply_resources "workloads/cronjobs.yaml" "CronJobs"
+
+# Step 9: Apply additional custom resources
+for cr_file in custom-resources/*.yaml; do
+    if [ "$cr_file" != "custom-resources/custom-resource-definitions.yaml" ] && [ -f "$cr_file" ]; then
+        basename_file=$(basename "$cr_file" .yaml)
+        apply_resources "$cr_file" "Custom Resource: $basename_file"
+    fi
+done
+
+print_success "EKS cluster restoration completed!"
+
+if [ "$DRY_RUN" = false ]; then
+    print_info "Verifying cluster status..."
+    kubectl get nodes
+    kubectl get pods --all-namespaces | head -10
+    print_info "Run 'kubectl get pods --all-namespaces' to see all pods"
+fi
+'''
+        
+        with open(file_path, 'w') as f:
+            f.write(script_content)
+        
+        # Make script executable
+        os.chmod(file_path, 0o755)
+    
     def generate_summary_report(self) -> str:
         """Generate a summary report of the exported resources."""
         report = []
@@ -1443,7 +2181,26 @@ class EKSConfigExporter:
         report.append("-" * 20)
         for resource_type, resources in self.export_data.get('resources', {}).items():
             if isinstance(resources, list):
-                report.append(f"{resource_type.capitalize()}: {len(resources)}")
+                count = len(resources)
+                if count > 0:  # Only show resources that exist
+                    # Format resource type names nicely
+                    formatted_name = resource_type.replace('_', ' ').title()
+                    if resource_type == 'eni_configs':
+                        formatted_name = 'ENI Configs'
+                    elif resource_type == 'network_attachment_definitions':
+                        formatted_name = 'Network Attachment Definitions'
+                    elif resource_type == 'security_group_policies':
+                        formatted_name = 'Security Group Policies'
+                    elif resource_type == 'cni_nodes':
+                        formatted_name = 'CNI Nodes'
+                    elif resource_type.startswith('karpenter_'):
+                        formatted_name = 'Karpenter ' + resource_type.replace('karpenter_', '').replace('_', ' ').title()
+                    
+                    report.append(f"{formatted_name}: {count}")
+            elif isinstance(resources, dict) and resource_type == 'additional_custom_resources':
+                total_instances = sum(len(data.get('instances', [])) for data in resources.values())
+                if total_instances > 0:
+                    report.append(f"Additional Custom Resources: {len(resources)} types, {total_instances} instances")
         
         report.append("")
         
@@ -1473,16 +2230,54 @@ class EKSConfigExporter:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Export EKS cluster configuration')
+    parser = argparse.ArgumentParser(
+        description='Export EKS cluster configuration with support for AWS-specific and CNI resources',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic export with all enhancements
+  %(prog)s my-cluster --include-aws-resources --include-custom-crds
+  
+  # Export for restoration with YAML format
+  %(prog)s my-cluster --output-format yaml --split-by-type --generate-restore-scripts
+  
+  # Export with filtering
+  %(prog)s my-cluster --exclude-secrets-data --namespace-filter=default,kube-system
+"""
+    )
+    
+    # Required arguments
     parser.add_argument('cluster_name', help='EKS cluster name')
+    
+    # Optional arguments
     parser.add_argument('--region', help='AWS region', default=None)
     parser.add_argument('--kubeconfig', help='Path to kubeconfig file', default=None)
     parser.add_argument('--output', '-o', help='Output file path', 
                        default='eks-export-{timestamp}.json')
     parser.add_argument('--format', choices=['json', 'yaml'], default='json',
-                       help='Output format')
+                       help='Output format for main export file')
     parser.add_argument('--summary', action='store_true',
                        help='Generate summary report')
+    
+    # Enhanced export options
+    parser.add_argument('--include-aws-resources', action='store_true',
+                       help='Include AWS-specific resources (ENIConfigs, SecurityGroupPolicies, etc.)')
+    parser.add_argument('--include-custom-crds', action='store_true', 
+                       help='Include custom resource instances from all CRDs')
+    parser.add_argument('--output-format', choices=['json', 'yaml', 'both'], default='json',
+                       help='Output format(s)')
+    parser.add_argument('--split-by-type', action='store_true',
+                       help='Generate individual YAML files by resource type for kubectl restore')
+    parser.add_argument('--generate-restore-scripts', action='store_true',
+                       help='Generate restoration scripts and guides')
+    parser.add_argument('--exclude-secrets-data', action='store_true',
+                       help='Exclude secret data values (keep only metadata)')
+    parser.add_argument('--namespace-filter', 
+                       help='Comma-separated list of namespaces to include')
+    parser.add_argument('--resource-type', 
+                       help='Comma-separated list of resource types to export')
+    parser.add_argument('--output-dir', 
+                       help='Output directory for split files (default: same as main output file)')
     
     args = parser.parse_args()
     
@@ -1491,6 +2286,12 @@ def main():
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         args.output = args.output.replace('{timestamp}', timestamp)
     
+    # Determine output directory
+    if args.output_dir:
+        output_dir = args.output_dir
+    else:
+        output_dir = os.path.dirname(args.output) or '.'
+    
     try:
         exporter = EKSConfigExporter(
             cluster_name=args.cluster_name,
@@ -1498,23 +2299,76 @@ def main():
             kubeconfig=args.kubeconfig
         )
         
-        exporter.export_all_resources()
-        exporter.save_to_file(args.output, args.format)
+        print(f"Exporting EKS cluster '{args.cluster_name}'...")
+        if args.include_aws_resources:
+            print("- Including AWS-specific resources (ENIConfigs, SecurityGroupPolicies, etc.)")
+        if args.include_custom_crds:
+            print("- Including custom resource instances")
+        if args.split_by_type:
+            print("- Generating individual YAML files by resource type")
         
+        exporter.export_all_resources()
+        
+        # Save main export file
+        main_format = args.format if args.output_format == 'json' else args.output_format
+        if main_format == 'both':
+            # Save both JSON and YAML
+            json_file = args.output if args.output.endswith('.json') else args.output.rsplit('.', 1)[0] + '.json'
+            yaml_file = args.output.rsplit('.', 1)[0] + '.yaml'
+            exporter.save_to_file(json_file, 'json')
+            exporter.save_to_file(yaml_file, 'yaml')
+            print(f"Export saved to: {json_file} and {yaml_file}")
+        else:
+            exporter.save_to_file(args.output, main_format)
+            print(f"Export saved to: {args.output}")
+        
+        # Generate split YAML files if requested
+        if args.split_by_type or args.generate_restore_scripts:
+            yaml_output_dir = os.path.join(output_dir, f"kubectl-restore-{args.cluster_name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            exporter.save_kubernetes_yaml_resources(yaml_output_dir)
+            print(f"Kubernetes YAML resources saved to: {yaml_output_dir}")
+        
+        # Generate summary report
         if args.summary:
             summary = exporter.generate_summary_report()
+            print("\n" + "=" * 60)
             print(summary)
+            print("=" * 60)
             
             summary_file = args.output.rsplit('.', 1)[0] + '_summary.txt'
             with open(summary_file, 'w') as f:
                 f.write(summary)
-            print(f"\nSummary report saved to: {summary_file}")
+            print(f"Summary report saved to: {summary_file}")
         
-        print(f"\nExport completed successfully!")
-        print(f"Output file: {args.output}")
+        # Show resource counts for new resources
+        resources = exporter.export_data.get('resources', {})
+        new_resource_counts = {
+            'ENI Configs': len(resources.get('eni_configs', [])),
+            'Network Attachment Definitions': len(resources.get('network_attachment_definitions', [])),
+            'Security Group Policies': len(resources.get('security_group_policies', [])),
+            'CNI Nodes': len(resources.get('cni_nodes', [])),
+            'Karpenter NodePools': len(resources.get('karpenter_nodepools', [])),
+            'Karpenter NodeClasses': len(resources.get('karpenter_nodeclasses', [])),
+            'Karpenter NodeClaims': len(resources.get('karpenter_nodeclaims', [])),
+            'Additional Custom Resources': len(resources.get('additional_custom_resources', {}))
+        }
+        
+        print("\nEnhanced Resource Summary:")
+        for resource_type, count in new_resource_counts.items():
+            if count > 0:
+                print(f"  {resource_type}: {count}")
+        
+        print(f"\n✅ Export completed successfully!")
+        
+        if args.split_by_type:
+            print(f"\n🚀 To restore this cluster configuration:")
+            print(f"   cd {yaml_output_dir}")
+            print(f"   ./restore-cluster.sh --validate-dependencies")
         
     except Exception as e:
-        print(f"Export failed: {e}", file=sys.stderr)
+        print(f"❌ Export failed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

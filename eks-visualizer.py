@@ -4,6 +4,7 @@ import json
 import yaml
 import argparse
 import os
+import sys
 from datetime import datetime
 from typing import Dict, List, Any
 
@@ -347,7 +348,7 @@ class EKSVisualizationGenerator:
             max-height: 400px;
         }}
         
-        .yaml-view {{
+        .view-content.yaml pre, .view-content.json pre {{
             background: #1a202c;
             color: #e2e8f0;
             padding: 1rem;
@@ -358,6 +359,7 @@ class EKSVisualizationGenerator:
             max-height: 500px;
             white-space: pre-wrap;
             border: 1px solid #4a5568;
+            margin: 0;
         }}
         
         .view-toggle {{
@@ -405,6 +407,9 @@ class EKSVisualizationGenerator:
             <button class="tab" onclick="showTab('configmaps')">ConfigMaps</button>
             <button class="tab" onclick="showTab('secrets')">Secrets</button>
             <button class="tab" onclick="showTab('storage')">Storage</button>
+            <button class="tab" onclick="showTab('networking')">Networking</button>
+            <button class="tab" onclick="showTab('karpenter')">Karpenter</button>
+            <button class="tab" onclick="showTab('custom-resources')">Custom Resources</button>
         </div>
         
         <div id="overview" class="tab-content active">
@@ -446,6 +451,18 @@ class EKSVisualizationGenerator:
         <div id="storage" class="tab-content">
             {self._generate_storage_content()}
         </div>
+        
+        <div id="networking" class="tab-content">
+            {self._generate_networking_content()}
+        </div>
+        
+        <div id="karpenter" class="tab-content">
+            {self._generate_karpenter_content()}
+        </div>
+        
+        <div id="custom-resources" class="tab-content">
+            {self._generate_custom_resources_content()}
+        </div>
     </div>
     
     <script>
@@ -470,7 +487,11 @@ class EKSVisualizationGenerator:
             'Namespaces': len(resources.get('namespaces', [])),
             'DaemonSets': len(resources.get('daemonsets', [])),
             'ConfigMaps': len(resources.get('configmaps', [])),
-            'Secrets': len(resources.get('secrets', []))
+            'Secrets': len(resources.get('secrets', [])),
+            'ENI Configs': len(resources.get('eni_configs', [])),
+            'Network Attachments': len(resources.get('network_attachment_definitions', [])),
+            'Karpenter NodePools': len(resources.get('karpenter_nodepools', [])),
+            'Custom Resources': len(resources.get('additional_custom_resources', {}))
         }
         
         for resource_type, count in resource_counts.items():
@@ -483,7 +504,11 @@ class EKSVisualizationGenerator:
                 'Namespaces': 'namespaces',
                 'DaemonSets': 'daemonsets',
                 'ConfigMaps': 'configmaps',
-                'Secrets': 'secrets'
+                'Secrets': 'secrets',
+                'ENI Configs': 'networking',
+                'Network Attachments': 'networking',
+                'Karpenter NodePools': 'karpenter',
+                'Custom Resources': 'custom-resources'
             }
             tab_name = tab_mapping.get(resource_type, resource_type.lower())
             
@@ -611,16 +636,17 @@ class EKSVisualizationGenerator:
                                 <button class="toggle-btn" onclick="showView(this, 'yaml')">YAML</button>
                             </div>
                             
-                            <div class="view-content summary-view">
+                            <div class="view-content summary active">
                                 <!-- Summary already shown above -->
                             </div>
                             
-                            <div class="view-content json-view" style="display: none;">
+                            <div class="view-content json">
                                 <pre>{json.dumps(pod, indent=2)}</pre>
                             </div>
                             
-                            <div class="view-content yaml-view" style="display: none;">
-{self._to_yaml(pod)}</div>
+                            <div class="view-content yaml">
+                                <pre>{self._to_yaml(pod)}</pre>
+                            </div>
                         </div>
                     </td>
                 </tr>
@@ -1290,6 +1316,255 @@ class EKSVisualizationGenerator:
         
         return content
     
+    def _generate_networking_content(self) -> str:
+        """Generate networking tab content with AWS CNI and Multus resources."""
+        resources = self.data.get('resources', {})
+        eni_configs = resources.get('eni_configs', [])
+        net_attachments = resources.get('network_attachment_definitions', [])
+        sg_policies = resources.get('security_group_policies', [])
+        cni_nodes = resources.get('cni_nodes', [])
+        
+        content = f'''
+        <h2>Networking Resources</h2>
+        
+        <div class="card">
+            <h3>AWS VPC CNI Resources</h3>
+            <p><strong>ENI Configs:</strong> {len(eni_configs)}</p>
+            <p><strong>Security Group Policies:</strong> {len(sg_policies)}</p>
+            <p><strong>CNI Nodes:</strong> {len(cni_nodes)}</p>
+        </div>
+        
+        <div class="card">
+            <h3>Multus CNI Resources</h3>
+            <p><strong>Network Attachment Definitions:</strong> {len(net_attachments)}</p>
+        </div>
+        '''
+        
+        if eni_configs:
+            content += f'''
+            <h3>ENI Configurations ({len(eni_configs)})</h3>
+            <table class="resource-table">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Subnet</th>
+                        <th>Security Groups</th>
+                        <th>Creation Time</th>
+                    </tr>
+                </thead>
+                <tbody>
+            '''
+            
+            for eni in eni_configs:
+                spec = eni.get('spec', {})
+                subnet_id = spec.get('subnet', 'N/A')
+                security_groups = ', '.join(spec.get('securityGroups', []))
+                age = self._calculate_age(eni.get('creation_timestamp'))
+                
+                content += f'''
+                    <tr class="expandable" onclick="toggleDetails(this)">
+                        <td>{eni.get('name', 'N/A')}</td>
+                        <td>{subnet_id}</td>
+                        <td>{security_groups}</td>
+                        <td>{age}</td>
+                    </tr>
+                    <tr>
+                        <td colspan="4">
+                            <div class="details">
+                                <h4>ENI Configuration Details</h4>
+                                <pre><code>{json.dumps(eni.get('full_config', eni), indent=2, default=str)}</code></pre>
+                            </div>
+                        </td>
+                    </tr>
+                '''
+            
+            content += '</tbody></table>'
+        
+        if net_attachments:
+            content += f'''
+            <h3>Network Attachment Definitions ({len(net_attachments)})</h3>
+            <table class="resource-table">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Namespace</th>
+                        <th>Config</th>
+                        <th>Creation Time</th>
+                    </tr>
+                </thead>
+                <tbody>
+            '''
+            
+            for net_attach in net_attachments:
+                spec = net_attach.get('spec', {})
+                config = spec.get('config', {})
+                if isinstance(config, str):
+                    config_type = 'JSON Config'
+                else:
+                    config_type = config.get('type', 'N/A')
+                age = self._calculate_age(net_attach.get('creation_timestamp'))
+                
+                content += f'''
+                    <tr class="expandable" onclick="toggleDetails(this)">
+                        <td>{net_attach.get('name', 'N/A')}</td>
+                        <td>{net_attach.get('namespace', 'N/A')}</td>
+                        <td>{config_type}</td>
+                        <td>{age}</td>
+                    </tr>
+                    <tr>
+                        <td colspan="4">
+                            <div class="details">
+                                <h4>Network Attachment Definition Details</h4>
+                                <pre><code>{json.dumps(net_attach.get('full_config', net_attach), indent=2, default=str)}</code></pre>
+                            </div>
+                        </td>
+                    </tr>
+                '''
+            
+            content += '</tbody></table>'
+        
+        return content
+    
+    def _generate_karpenter_content(self) -> str:
+        """Generate Karpenter resources tab content."""
+        resources = self.data.get('resources', {})
+        nodepools = resources.get('karpenter_nodepools', [])
+        nodeclasses = resources.get('karpenter_nodeclasses', [])
+        nodeclaims = resources.get('karpenter_nodeclaims', [])
+        
+        content = f'''
+        <h2>Karpenter Resources</h2>
+        
+        <div class="card">
+            <h3>Resource Summary</h3>
+            <p><strong>Node Pools:</strong> {len(nodepools)}</p>
+            <p><strong>Node Classes:</strong> {len(nodeclasses)}</p>
+            <p><strong>Node Claims:</strong> {len(nodeclaims)}</p>
+        </div>
+        '''
+        
+        if nodepools:
+            content += f'''
+            <h3>Node Pools ({len(nodepools)})</h3>
+            <table class="resource-table">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Node Class Ref</th>
+                        <th>Requirements</th>
+                        <th>Limits</th>
+                        <th>Creation Time</th>
+                    </tr>
+                </thead>
+                <tbody>
+            '''
+            
+            for nodepool in nodepools:
+                spec = nodepool.get('spec', {})
+                nodeclass_ref = spec.get('template', {}).get('spec', {}).get('nodeClassRef', {}).get('name', 'N/A')
+                requirements = len(spec.get('template', {}).get('spec', {}).get('requirements', []))
+                limits = spec.get('limits', {})
+                age = self._calculate_age(nodepool.get('creation_timestamp'))
+                
+                content += f'''
+                    <tr class="expandable" onclick="toggleDetails(this)">
+                        <td>{nodepool.get('name', 'N/A')}</td>
+                        <td>{nodeclass_ref}</td>
+                        <td>{requirements} requirements</td>
+                        <td>{len(limits)} limits</td>
+                        <td>{age}</td>
+                    </tr>
+                    <tr>
+                        <td colspan="5">
+                            <div class="details">
+                                <h4>Node Pool Details</h4>
+                                <pre><code>{json.dumps(nodepool.get('full_config', nodepool), indent=2, default=str)}</code></pre>
+                            </div>
+                        </td>
+                    </tr>
+                '''
+            
+            content += '</tbody></table>'
+        
+        return content
+    
+    def _generate_custom_resources_content(self) -> str:
+        """Generate custom resources tab content."""
+        resources = self.data.get('resources', {})
+        crds = resources.get('custom_resource_definitions', [])
+        additional_crs = resources.get('additional_custom_resources', {})
+        
+        content = f'''
+        <h2>Custom Resources</h2>
+        
+        <div class="card">
+            <h3>Resource Summary</h3>
+            <p><strong>Custom Resource Definitions:</strong> {len(crds)}</p>
+            <p><strong>Additional Custom Resource Types:</strong> {len(additional_crs)}</p>
+            <p><strong>Total Custom Resource Instances:</strong> {sum(len(data.get('instances', [])) for data in additional_crs.values())}</p>
+        </div>
+        '''
+        
+        if additional_crs:
+            content += f'''
+            <h3>Custom Resource Instances ({len(additional_crs)} types)</h3>
+            '''
+            
+            for resource_key, resource_data in additional_crs.items():
+                crd_info = resource_data.get('crd_info', {})
+                instances = resource_data.get('instances', [])
+                
+                if instances:
+                    content += f'''
+                    <div class="card">
+                        <h4>{resource_key} ({len(instances)} instances)</h4>
+                        <p><strong>Group:</strong> {crd_info.get('group', 'N/A')}</p>
+                        <p><strong>Version:</strong> {crd_info.get('version', 'N/A')}</p>
+                        <p><strong>Plural:</strong> {crd_info.get('plural', 'N/A')}</p>
+                        <p><strong>Scope:</strong> {crd_info.get('scope', 'N/A')}</p>
+                        <p><em>Showing first {min(5, len(instances))} instances:</em></p>
+                        
+                        <table class="resource-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Namespace</th>
+                                    <th>Creation Time</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                    '''
+                    
+                    for instance in instances[:5]:  # Show first 5 instances
+                        metadata = instance.get('metadata', {})
+                        namespace = metadata.get('namespace', 'N/A')
+                        age = self._calculate_age(metadata.get('creationTimestamp'))
+                        
+                        content += f'''
+                            <tr class="expandable" onclick="toggleDetails(this)">
+                                <td>{metadata.get('name', 'N/A')}</td>
+                                <td>{namespace}</td>
+                                <td>{age}</td>
+                            </tr>
+                            <tr>
+                                <td colspan="3">
+                                    <div class="details">
+                                        <h4>Custom Resource Instance</h4>
+                                        <pre><code>{json.dumps(instance, indent=2, default=str)[:1000]}{'...' if len(json.dumps(instance, indent=2, default=str)) > 1000 else ''}</code></pre>
+                                    </div>
+                                </td>
+                            </tr>
+                        '''
+                    
+                    content += '</tbody></table>'
+                    
+                    if len(instances) > 5:
+                        content += f'<p><em>... and {len(instances) - 5} more instances</em></p>'
+                    
+                    content += '</div>'
+        
+        return content
+    
     def _generate_javascript(self) -> str:
         """Generate JavaScript for interactivity."""
         return '''
@@ -1438,7 +1713,7 @@ class EKSVisualizationGenerator:
         
         try:
             timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            now = datetime.utcnow().replace(tzinfo=timestamp.tzinfo)
+            now = datetime.now(timestamp.tzinfo)
             delta = now - timestamp
             
             days = delta.days
