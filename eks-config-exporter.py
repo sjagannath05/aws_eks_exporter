@@ -781,26 +781,39 @@ class EKSConfigExporter:
             self.logger.error(f"Failed to export endpoints: {e}")
     
     def export_endpoint_slices(self):
-        """Export all endpoint slices."""
+        """Export all endpoint slices.
+
+        Uses the raw JSON response instead of the typed client call. The
+        generated V1EndpointSlice model treats 'endpoints' as a required,
+        non-nullable field, but real clusters do produce EndpointSlices
+        with endpoints=null (seen on headless/no-backend services). The
+        typed call raises on the very first such object and the whole
+        list is lost, not just the offending item; _preload_content=False
+        sidesteps client-side model validation entirely.
+        """
         try:
-            endpoint_slices = self.k8s_client['discovery_v1'].list_endpoint_slice_for_all_namespaces()
+            raw = self.k8s_client['discovery_v1'].list_endpoint_slice_for_all_namespaces(
+                _preload_content=False)
+            payload = json.loads(raw.data)
             self.export_data['resources']['endpoint_slices'] = []
             
-            for es in endpoint_slices.items:
+            for es in payload.get('items', []):
+                metadata = es.get('metadata') or {}
                 es_info = {
-                    'name': es.metadata.name,
-                    'namespace': es.metadata.namespace,
-                    'labels': es.metadata.labels or {},
-                    'annotations': es.metadata.annotations or {},
-                    'address_type': es.address_type,
-                    'endpoints': len(es.endpoints or []),
-                    'ports': [{'name': p.name, 'port': p.port, 'protocol': p.protocol} for p in (es.ports or [])],
-                    'creation_timestamp': es.metadata.creation_timestamp.isoformat() if es.metadata.creation_timestamp else None
+                    'name': metadata.get('name'),
+                    'namespace': metadata.get('namespace'),
+                    'labels': metadata.get('labels') or {},
+                    'annotations': metadata.get('annotations') or {},
+                    'address_type': es.get('addressType'),
+                    'endpoints': len(es.get('endpoints') or []),
+                    'ports': [{'name': p.get('name'), 'port': p.get('port'), 'protocol': p.get('protocol')}
+                              for p in (es.get('ports') or [])],
+                    'creation_timestamp': metadata.get('creationTimestamp')
                 }
                 
                 self.export_data['resources']['endpoint_slices'].append(es_info)
                 
-        except ApiException as e:
+        except Exception as e:
             self.logger.error(f"Failed to export endpoint slices: {e}")
     
     def export_ingress_classes(self):
