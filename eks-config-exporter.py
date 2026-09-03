@@ -9,6 +9,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 import subprocess
 import boto3
+import kubeconfig_utils
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 import logging
@@ -21,26 +22,34 @@ class EKSConfigExporter:
     daemonsets, configmaps, secrets, namespaces, and EKS-specific configurations.
     """
     
-    def __init__(self, cluster_name: str, region: str = None, kubeconfig: str = None,
+    def __init__(self, cluster_name: str = None, region: str = None, kubeconfig: str = None,
                  context: str = None):
-        self.cluster_name = cluster_name
-        self.region = region or os.environ.get('AWS_DEFAULT_REGION', 'us-west-2')
+        self.logger = logging.getLogger(__name__)
+        logging.basicConfig(level=logging.INFO)
+
         self.kubeconfig = kubeconfig
         self.context = context
+        self.kube_context_info = None   # kubeconfig_utils.ContextInfo or None
+        self.kube_identity = None       # kubeconfig_utils.EksIdentity or None
+        self._resolve_kube_identity()
+
+        self.cluster_name = self._resolve_cluster_name(cluster_name)
+        self.region = self._resolve_region(region)
+        self.account_id = self.kube_identity.account if self.kube_identity else None
         self.export_data = {
             'metadata': {
-                'cluster_name': cluster_name,
+                'cluster_name': self.cluster_name,
                 'region': self.region,
-                'kube_context': context,
+                'account_id': self.account_id,
+                'kube_context': self.kube_context_info.name if self.kube_context_info else context,
+                'kube_server': self.kube_context_info.server if self.kube_context_info else None,
+                'kubeconfig': kubeconfig_utils.kubeconfig_paths(kubeconfig) if (kubeconfig or self.kube_context_info) else None,
                 'export_timestamp': datetime.now(timezone.utc).isoformat(),
                 'exporter_version': '1.0.0'
             },
             'cluster_info': {},
             'resources': {}
         }
-        
-        self.logger = logging.getLogger(__name__)
-        logging.basicConfig(level=logging.INFO)
         
         # Initialize clients
         self.aws_client = None
@@ -67,6 +76,56 @@ class EKSConfigExporter:
             self.logger.warning(f"Failed to get kubectl describe for {resource_type}/{resource_name}: {e}")
             return f"Error getting describe info: {str(e)}"
     
+    def _resolve_kube_identity(self):
+        """Read the kubeconfig (if any) to learn which EKS cluster the context points at."""
+        try:
+            cfg = kubeconfig_utils.load_kubeconfig(self.kubeconfig)
+            self.kube_context_info = kubeconfig_utils.resolve_context(cfg, self.context)
+            self.kube_identity = kubeconfig_utils.eks_identity_for_context(cfg, self.context)
+        except kubeconfig_utils.KubeconfigError as e:
+            if self.kubeconfig or self.context:
+                # User asked for a specific file/context: failing to read it is fatal.
+                raise ValueError(str(e)) from e
+            self.logger.debug(f"No usable kubeconfig ({e}); assuming in-cluster or default config")
+            return
+        if self.kube_identity:
+            self.logger.info(
+                f"kubeconfig context '{self.kube_context_info.name}' -> EKS cluster "
+                f"'{self.kube_identity.cluster_name}' region={self.kube_identity.region} "
+                f"account={self.kube_identity.account} (from {self.kube_identity.source})")
+        else:
+            self.logger.warning(
+                f"kubeconfig context '{self.kube_context_info.name}' does not look like an EKS cluster; "
+                "cluster name and region must be passed explicitly")
+
+    def _resolve_cluster_name(self, cluster_name: str) -> str:
+        derived = self.kube_identity.cluster_name if self.kube_identity else None
+        if cluster_name and derived and cluster_name != derived:
+            raise ValueError(
+                f"cluster name '{cluster_name}' does not match kubeconfig context "
+                f"'{self.kube_context_info.name}' which points at EKS cluster '{derived}'. "
+                "Fix the argument or choose another --context.")
+        if cluster_name:
+            return cluster_name
+        if derived:
+            return derived
+        raise ValueError(
+            "cluster name not given and could not be derived from the kubeconfig context; "
+            "pass it as the first positional argument")
+
+    def _resolve_region(self, region: str) -> str:
+        derived = self.kube_identity.region if self.kube_identity else None
+        if region and derived and region != derived:
+            raise ValueError(
+                f"region '{region}' does not match kubeconfig context "
+                f"'{self.kube_context_info.name}' which is in region '{derived}'")
+        resolved = (region or derived
+                    or os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION')
+                    or boto3.session.Session().region_name)
+        if not resolved:
+            raise ValueError("AWS region not given, not derivable from kubeconfig, and not set in AWS config; pass --region")
+        return resolved
+
     def _kubectl_global_args(self) -> list:
         """Flags so kubectl talks to the same cluster as the Python client."""
         args = []
@@ -2259,10 +2318,12 @@ Examples:
     )
     
     # Required arguments
-    parser.add_argument('cluster_name', help='EKS cluster name')
+    parser.add_argument('cluster_name', nargs='?', default=None,
+                       help='EKS cluster name (default: derived from the kubeconfig context)')
     
     # Optional arguments
-    parser.add_argument('--region', help='AWS region', default=None)
+    parser.add_argument('--region', default=None,
+                       help='AWS region (default: derived from the kubeconfig context, then AWS config)')
     parser.add_argument('--kubeconfig', help='Path to kubeconfig file (default: $KUBECONFIG or ~/.kube/config)',
                        default=None)
     parser.add_argument('--context', help='kubeconfig context to use (default: current-context)',
@@ -2315,7 +2376,8 @@ Examples:
             context=args.context
         )
         
-        print(f"Exporting EKS cluster '{args.cluster_name}'...")
+        print(f"Exporting EKS cluster '{exporter.cluster_name}' (region {exporter.region}, "
+              f"context {exporter.export_data['metadata']['kube_context'] or 'default'})...")
         if args.include_aws_resources:
             print("- Including AWS-specific resources (ENIConfigs, SecurityGroupPolicies, etc.)")
         if args.include_custom_crds:
@@ -2340,7 +2402,7 @@ Examples:
         
         # Generate split YAML files if requested
         if args.split_by_type or args.generate_restore_scripts:
-            yaml_output_dir = os.path.join(output_dir, f"kubectl-restore-{args.cluster_name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            yaml_output_dir = os.path.join(output_dir, f"kubectl-restore-{exporter.cluster_name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}")
             exporter.save_kubernetes_yaml_resources(yaml_output_dir)
             print(f"Kubernetes YAML resources saved to: {yaml_output_dir}")
         
