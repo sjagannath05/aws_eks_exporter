@@ -15,6 +15,10 @@ from kubernetes.client.rest import ApiException
 import logging
 from pathlib import Path
 
+class ExportError(Exception):
+    """Fatal export problem with a user-actionable message."""
+
+
 class EKSConfigExporter:
     """
     Comprehensive EKS cluster configuration exporter and visualizer.
@@ -23,12 +27,13 @@ class EKSConfigExporter:
     """
     
     def __init__(self, cluster_name: str = None, region: str = None, kubeconfig: str = None,
-                 context: str = None):
+                 context: str = None, skip_aws: bool = False):
         self.logger = logging.getLogger(__name__)
         logging.basicConfig(level=logging.INFO)
 
         self.kubeconfig = kubeconfig
         self.context = context
+        self.skip_aws = skip_aws
         self.kube_context_info = None   # kubeconfig_utils.ContextInfo or None
         self.kube_identity = None       # kubeconfig_utils.EksIdentity or None
         self._resolve_kube_identity()
@@ -44,6 +49,7 @@ class EKSConfigExporter:
                 'kube_context': self.kube_context_info.name if self.kube_context_info else context,
                 'kube_server': self.kube_context_info.server if self.kube_context_info else None,
                 'kubeconfig': kubeconfig_utils.kubeconfig_paths(kubeconfig) if (kubeconfig or self.kube_context_info) else None,
+                'aws_metadata': 'skipped' if skip_aws else 'included',
                 'export_timestamp': datetime.now(timezone.utc).isoformat(),
                 'exporter_version': '1.0.0'
             },
@@ -192,7 +198,17 @@ class EKSConfigExporter:
             raise
     
     def export_cluster_info(self):
-        """Export EKS cluster basic information."""
+        """Export EKS cluster basic information.
+
+        Raises ExportError when the EKS API call fails (wrong region/account,
+        missing permissions, no credentials) unless skip_aws was requested.
+        A silent failure here used to produce a 'successful' export whose
+        AWS metadata belonged to no cluster at all.
+        """
+        if self.skip_aws:
+            self.logger.info("Skipping EKS API metadata (--skip-aws)")
+            self.export_data['cluster_info'] = {}
+            return
         try:
             cluster_info = self.aws_client.describe_cluster(name=self.cluster_name)
             self.export_data['cluster_info'] = cluster_info['cluster']
@@ -209,7 +225,12 @@ class EKSConfigExporter:
                 self.export_data['cluster_info']['nodegroups'].append(ng_detail['nodegroup'])
                 
         except Exception as e:
-            self.logger.error(f"Failed to export cluster info: {e}")
+            hint = (f"cluster '{self.cluster_name}' in region '{self.region}'"
+                    + (f" (kubeconfig says account {self.account_id})" if self.account_id else ""))
+            raise ExportError(
+                f"EKS API lookup failed for {hint}: {e}. "
+                "Check --region/cluster name and AWS credentials, or pass --skip-aws to export "
+                "Kubernetes resources without EKS metadata.") from e
     
     def export_namespaces(self):
         """Export all namespaces."""
@@ -1682,8 +1703,11 @@ class EKSConfigExporter:
         """Export all Kubernetes resources."""
         self.logger.info("Starting comprehensive resource export...")
         
+        # EKS metadata first, outside the tolerant loop: a failure here means the
+        # name/region/credentials are wrong and continuing would be misleading.
+        self.export_cluster_info()
+
         export_methods = [
-            ('cluster_info', self.export_cluster_info),
             ('namespaces', self.export_namespaces),
             ('nodes', self.export_nodes),
             ('pods', self.export_pods),
@@ -2328,6 +2352,8 @@ Examples:
                        default=None)
     parser.add_argument('--context', help='kubeconfig context to use (default: current-context)',
                        default=None)
+    parser.add_argument('--skip-aws', action='store_true',
+                       help='Do not call the EKS API (cluster/nodegroup metadata); export Kubernetes resources only')
     parser.add_argument('--output', '-o', help='Output file path', 
                        default='eks-export-{timestamp}.json')
     parser.add_argument('--format', choices=['json', 'yaml'], default='json',
@@ -2373,7 +2399,8 @@ Examples:
             cluster_name=args.cluster_name,
             region=args.region,
             kubeconfig=args.kubeconfig,
-            context=args.context
+            context=args.context,
+            skip_aws=args.skip_aws
         )
         
         print(f"Exporting EKS cluster '{exporter.cluster_name}' (region {exporter.region}, "
