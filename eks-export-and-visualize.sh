@@ -20,6 +20,8 @@ KUBECONFIG_PATH=""          # from -k; $KUBECONFIG env is honoured when this is 
 KUBE_CONTEXT=""
 ALL_CONTEXTS=false
 SKIP_AWS=false
+QPS=""
+BURST=""
 LIST_CONTEXTS=false
 EXPORT_FORMAT="json"
 GENERATE_HTML=true
@@ -71,6 +73,8 @@ Options:
   -o, --output OUTPUT_DIR      Output directory (default: exported)
   -k, --kubeconfig PATH        Path to kubeconfig file (default: \$KUBECONFIG, then ~/.kube/config)
   --skip-aws                   Do not call the EKS API; export Kubernetes resources only
+  --qps N                      Max Kubernetes API requests/sec incl. kubectl describe (default: 10; 0 disables)
+  --burst N                    Requests allowed above --qps before throttling (default: 20)
   -f, --format FORMAT          Export format: json or yaml (default: json)
   -v, --venv VENV_DIR          Path to virtual environment directory
   --include-aws-resources      Include AWS-specific resources (ENIConfigs, etc.)
@@ -260,6 +264,14 @@ export_cluster_config() {
     
     if [ "$SKIP_AWS" = true ]; then
         EXPORT_CMD="$EXPORT_CMD --skip-aws"
+    fi
+    
+    if [ -n "$QPS" ]; then
+        EXPORT_CMD="$EXPORT_CMD --qps $QPS"
+    fi
+    
+    if [ -n "$BURST" ]; then
+        EXPORT_CMD="$EXPORT_CMD --burst $BURST"
     fi
     
     EXPORT_CMD="$EXPORT_CMD --output $EXPORT_FILE --format $EXPORT_FORMAT"
@@ -465,6 +477,14 @@ while [[ $# -gt 0 ]]; do
         --skip-aws)
             SKIP_AWS=true
             shift
+            ;;
+        --qps)
+            QPS="$2"
+            shift 2
+            ;;
+        --burst)
+            BURST="$2"
+            shift 2
             ;;
         -f|--format)
             EXPORT_FORMAT="$2"

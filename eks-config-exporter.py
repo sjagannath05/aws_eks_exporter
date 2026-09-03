@@ -11,7 +11,9 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 import subprocess
 import boto3
+from botocore.config import Config as BotoConfig
 import kubeconfig_utils
+import ratelimit
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 import logging
@@ -29,13 +31,17 @@ class EKSConfigExporter:
     """
     
     def __init__(self, cluster_name: str = None, region: str = None, kubeconfig: str = None,
-                 context: str = None, skip_aws: bool = False):
+                 context: str = None, skip_aws: bool = False,
+                 qps: float = ratelimit.DEFAULT_QPS, burst: int = ratelimit.DEFAULT_BURST):
         self.logger = logging.getLogger(__name__)
         logging.basicConfig(level=logging.INFO)
 
         self.kubeconfig = kubeconfig
         self.context = context
         self.skip_aws = skip_aws
+        # One bucket shared by the Python client and kubectl describe so the
+        # API server sees a single bounded stream. qps/burst <= 0 disables it.
+        self.rate_limiter = ratelimit.TokenBucket(rate=qps, burst=burst)
         self.kube_context_info = None   # kubeconfig_utils.ContextInfo or None
         self.kube_identity = None       # kubeconfig_utils.EksIdentity or None
         self._resolve_kube_identity()
@@ -52,6 +58,7 @@ class EKSConfigExporter:
                 'kube_server': self.kube_context_info.server if self.kube_context_info else None,
                 'kubeconfig': kubeconfig_utils.kubeconfig_paths(kubeconfig) if (kubeconfig or self.kube_context_info) else None,
                 'aws_metadata': 'skipped' if skip_aws else 'included',
+                'rate_limit': {'qps': qps, 'burst': burst} if self.rate_limiter.enabled else None,
                 'export_timestamp': datetime.now(timezone.utc).isoformat(),
                 'exporter_version': '1.0.0'
             },
@@ -71,6 +78,7 @@ class EKSConfigExporter:
             if namespace:
                 cmd.extend(['-n', namespace])
             
+            self.rate_limiter.acquire()
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
                 return result.stdout
@@ -174,7 +182,9 @@ class EKSConfigExporter:
         """Initialize AWS and Kubernetes clients."""
         try:
             # AWS client (not needed with --skip-aws)
-            self.aws_client = None if self.skip_aws else boto3.client('eks', region_name=self.region)
+            self.aws_client = None if self.skip_aws else boto3.client(
+                'eks', region_name=self.region,
+                config=BotoConfig(retries={'mode': 'adaptive', 'max_attempts': 8}))
             
             # Kubernetes client
             if self.kubeconfig or self.context:
@@ -221,6 +231,17 @@ class EKSConfigExporter:
             except AttributeError:
                 self.k8s_client['policy_v1beta1'] = None
                 self.logger.warning("PolicyV1beta1Api not available in this Kubernetes client version")
+            
+            # Rate-limit + 429 retry for every API call without touching the 55 call sites.
+            self.k8s_client = {
+                name: (ratelimit.RateLimitedApi(api, self.rate_limiter, ApiException) if api is not None else None)
+                for name, api in self.k8s_client.items()
+            }
+            if self.rate_limiter.enabled:
+                self.logger.info(f"Rate limit: {self.rate_limiter.rate:g} req/s, burst {self.rate_limiter.burst} "
+                                 "(shared by API calls and kubectl describe)")
+            else:
+                self.logger.warning("Rate limiting disabled (--qps 0)")
             
         except Exception as e:
             self.logger.error(f"Failed to initialize clients: {e}")
@@ -1802,6 +1823,8 @@ class EKSConfigExporter:
             except Exception as e:
                 self.logger.error(f"Failed to export {resource_name}: {e}")
         
+        if self.rate_limiter.waited_total > 0:
+            self.logger.info(f"Rate limiter throttled for {self.rate_limiter.waited_total:.1f}s in total")
         self.logger.info("Resource export completed")
     
     def save_to_file(self, output_file: str, format: str = 'json'):
@@ -2389,6 +2412,11 @@ Examples:
                             'output filenames get a -<context> suffix or fill a {context} placeholder)')
     parser.add_argument('--list-contexts', action='store_true',
                        help='List kubeconfig contexts with their derived EKS cluster/region and exit')
+    parser.add_argument('--qps', type=float, default=ratelimit.DEFAULT_QPS,
+                       help=f'Max Kubernetes API requests per second, shared by API calls and kubectl describe '
+                            f'(default: {ratelimit.DEFAULT_QPS:g}; 0 disables)')
+    parser.add_argument('--burst', type=int, default=ratelimit.DEFAULT_BURST,
+                       help=f'Requests allowed above --qps before throttling (default: {ratelimit.DEFAULT_BURST})')
     parser.add_argument('--skip-aws', action='store_true',
                        help='Do not call the EKS API (cluster/nodegroup metadata); export Kubernetes resources only')
     parser.add_argument('--output', '-o', help='Output file path', 
@@ -2547,7 +2575,9 @@ def run_export(args, context: str, output: str, output_dir: str) -> None:
         region=args.region,
         kubeconfig=args.kubeconfig,
         context=context,
-        skip_aws=args.skip_aws
+        skip_aws=args.skip_aws,
+        qps=args.qps,
+        burst=args.burst
     )
     
     print(f"Exporting EKS cluster '{exporter.cluster_name}' (region {exporter.region}, "
