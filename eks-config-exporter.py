@@ -21,14 +21,17 @@ class EKSConfigExporter:
     daemonsets, configmaps, secrets, namespaces, and EKS-specific configurations.
     """
     
-    def __init__(self, cluster_name: str, region: str = None, kubeconfig: str = None):
+    def __init__(self, cluster_name: str, region: str = None, kubeconfig: str = None,
+                 context: str = None):
         self.cluster_name = cluster_name
         self.region = region or os.environ.get('AWS_DEFAULT_REGION', 'us-west-2')
         self.kubeconfig = kubeconfig
+        self.context = context
         self.export_data = {
             'metadata': {
                 'cluster_name': cluster_name,
                 'region': self.region,
+                'kube_context': context,
                 'export_timestamp': datetime.now(timezone.utc).isoformat(),
                 'exporter_version': '1.0.0'
             },
@@ -47,7 +50,7 @@ class EKSConfigExporter:
     def _get_kubectl_describe(self, resource_type: str, resource_name: str, namespace: str = None) -> str:
         """Get kubectl describe output for a resource."""
         try:
-            cmd = ['kubectl', 'describe', resource_type, resource_name]
+            cmd = ['kubectl'] + self._kubectl_global_args() + ['describe', resource_type, resource_name]
             if namespace:
                 cmd.extend(['-n', namespace])
             
@@ -64,6 +67,15 @@ class EKSConfigExporter:
             self.logger.warning(f"Failed to get kubectl describe for {resource_type}/{resource_name}: {e}")
             return f"Error getting describe info: {str(e)}"
     
+    def _kubectl_global_args(self) -> list:
+        """Flags so kubectl talks to the same cluster as the Python client."""
+        args = []
+        if self.kubeconfig:
+            args.extend(['--kubeconfig', self.kubeconfig])
+        if self.context:
+            args.extend(['--context', self.context])
+        return args
+
     def _init_clients(self):
         """Initialize AWS and Kubernetes clients."""
         try:
@@ -71,12 +83,12 @@ class EKSConfigExporter:
             self.aws_client = boto3.client('eks', region_name=self.region)
             
             # Kubernetes client
-            if self.kubeconfig:
-                config.load_kube_config(config_file=self.kubeconfig)
+            if self.kubeconfig or self.context:
+                config.load_kube_config(config_file=self.kubeconfig, context=self.context)
             else:
                 try:
                     config.load_incluster_config()
-                except:
+                except config.ConfigException:
                     config.load_kube_config()
             
             self.k8s_client = {
@@ -2251,7 +2263,10 @@ Examples:
     
     # Optional arguments
     parser.add_argument('--region', help='AWS region', default=None)
-    parser.add_argument('--kubeconfig', help='Path to kubeconfig file', default=None)
+    parser.add_argument('--kubeconfig', help='Path to kubeconfig file (default: $KUBECONFIG or ~/.kube/config)',
+                       default=None)
+    parser.add_argument('--context', help='kubeconfig context to use (default: current-context)',
+                       default=None)
     parser.add_argument('--output', '-o', help='Output file path', 
                        default='eks-export-{timestamp}.json')
     parser.add_argument('--format', choices=['json', 'yaml'], default='json',
@@ -2296,7 +2311,8 @@ Examples:
         exporter = EKSConfigExporter(
             cluster_name=args.cluster_name,
             region=args.region,
-            kubeconfig=args.kubeconfig
+            kubeconfig=args.kubeconfig,
+            context=args.context
         )
         
         print(f"Exporting EKS cluster '{args.cluster_name}'...")
