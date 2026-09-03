@@ -2352,6 +2352,11 @@ Examples:
                        default=None)
     parser.add_argument('--context', help='kubeconfig context to use (default: current-context)',
                        default=None)
+    parser.add_argument('--all-contexts', action='store_true',
+                       help='Export every context in the kubeconfig (one output per unique cluster; '
+                            'output filenames get a -<context> suffix or fill a {context} placeholder)')
+    parser.add_argument('--list-contexts', action='store_true',
+                       help='List kubeconfig contexts with their derived EKS cluster/region and exit')
     parser.add_argument('--skip-aws', action='store_true',
                        help='Do not call the EKS API (cluster/nodegroup metadata); export Kubernetes resources only')
     parser.add_argument('--output', '-o', help='Output file path', 
@@ -2389,93 +2394,190 @@ Examples:
         args.output = args.output.replace('{timestamp}', timestamp)
     
     # Determine output directory
-    if args.output_dir:
-        output_dir = args.output_dir
-    else:
-        output_dir = os.path.dirname(args.output) or '.'
-    
+    output_dir = args.output_dir or (os.path.dirname(args.output) or '.')
+
+    if args.list_contexts:
+        sys.exit(list_contexts(args.kubeconfig))
+
+    if args.all_contexts:
+        sys.exit(run_all_contexts(args, output_dir))
+
     try:
-        exporter = EKSConfigExporter(
-            cluster_name=args.cluster_name,
-            region=args.region,
-            kubeconfig=args.kubeconfig,
-            context=args.context,
-            skip_aws=args.skip_aws
-        )
-        
-        print(f"Exporting EKS cluster '{exporter.cluster_name}' (region {exporter.region}, "
-              f"context {exporter.export_data['metadata']['kube_context'] or 'default'})...")
-        if args.include_aws_resources:
-            print("- Including AWS-specific resources (ENIConfigs, SecurityGroupPolicies, etc.)")
-        if args.include_custom_crds:
-            print("- Including custom resource instances")
-        if args.split_by_type:
-            print("- Generating individual YAML files by resource type")
-        
-        exporter.export_all_resources()
-        
-        # Save main export file
-        main_format = args.format if args.output_format == 'json' else args.output_format
-        if main_format == 'both':
-            # Save both JSON and YAML
-            json_file = args.output if args.output.endswith('.json') else args.output.rsplit('.', 1)[0] + '.json'
-            yaml_file = args.output.rsplit('.', 1)[0] + '.yaml'
-            exporter.save_to_file(json_file, 'json')
-            exporter.save_to_file(yaml_file, 'yaml')
-            print(f"Export saved to: {json_file} and {yaml_file}")
-        else:
-            exporter.save_to_file(args.output, main_format)
-            print(f"Export saved to: {args.output}")
-        
-        # Generate split YAML files if requested
-        if args.split_by_type or args.generate_restore_scripts:
-            yaml_output_dir = os.path.join(output_dir, f"kubectl-restore-{exporter.cluster_name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-            exporter.save_kubernetes_yaml_resources(yaml_output_dir)
-            print(f"Kubernetes YAML resources saved to: {yaml_output_dir}")
-        
-        # Generate summary report
-        if args.summary:
-            summary = exporter.generate_summary_report()
-            print("\n" + "=" * 60)
-            print(summary)
-            print("=" * 60)
-            
-            summary_file = args.output.rsplit('.', 1)[0] + '_summary.txt'
-            with open(summary_file, 'w') as f:
-                f.write(summary)
-            print(f"Summary report saved to: {summary_file}")
-        
-        # Show resource counts for new resources
-        resources = exporter.export_data.get('resources', {})
-        new_resource_counts = {
-            'ENI Configs': len(resources.get('eni_configs', [])),
-            'Network Attachment Definitions': len(resources.get('network_attachment_definitions', [])),
-            'Security Group Policies': len(resources.get('security_group_policies', [])),
-            'CNI Nodes': len(resources.get('cni_nodes', [])),
-            'Karpenter NodePools': len(resources.get('karpenter_nodepools', [])),
-            'Karpenter NodeClasses': len(resources.get('karpenter_nodeclasses', [])),
-            'Karpenter NodeClaims': len(resources.get('karpenter_nodeclaims', [])),
-            'Additional Custom Resources': len(resources.get('additional_custom_resources', {}))
-        }
-        
-        print("\nEnhanced Resource Summary:")
-        for resource_type, count in new_resource_counts.items():
-            if count > 0:
-                print(f"  {resource_type}: {count}")
-        
-        print(f"\n✅ Export completed successfully!")
-        
-        if args.split_by_type:
-            print(f"\n🚀 To restore this cluster configuration:")
-            print(f"   cd {yaml_output_dir}")
-            print(f"   ./restore-cluster.sh --validate-dependencies")
-        
+        run_export(args, args.context, args.output, output_dir)
+    except (ExportError, ValueError, kubeconfig_utils.KubeconfigError) as e:
+        print(f"\u274c Export failed: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"❌ Export failed: {e}", file=sys.stderr)
+        print(f"\u274c Export failed: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
+
+def list_contexts(kubeconfig: str) -> int:
+    """Print each context with its derived EKS identity. Returns an exit code."""
+    try:
+        cfg = kubeconfig_utils.load_kubeconfig(kubeconfig)
+    except kubeconfig_utils.KubeconfigError as e:
+        print(f"\u274c {e}", file=sys.stderr)
+        return 1
+    current = kubeconfig_utils.current_context_name(cfg)
+    print(f"{'':2}{'CONTEXT':<70} {'EKS CLUSTER':<40} {'REGION':<16} ACCOUNT")
+    for name in kubeconfig_utils.list_context_names(cfg):
+        try:
+            ident = kubeconfig_utils.eks_identity_for_context(cfg, name)
+        except kubeconfig_utils.KubeconfigError as e:
+            print(f"{'*' if name == current else ' ':2}{name:<70} <error: {e}>")
+            continue
+        mark = '*' if name == current else ' '
+        if ident:
+            print(f"{mark:2}{name:<70} {ident.cluster_name:<40} {ident.region or '-':<16} {ident.account or '-'}")
+        else:
+            print(f"{mark:2}{name:<70} {'(not an EKS cluster)':<40} {'-':<16} -")
+    return 0
+
+
+def output_path_for_context(output: str, context: str) -> str:
+    """'x.json' + 'fr5' -> 'x-fr5.json'; honours a literal {context} placeholder."""
+    if '{context}' in output:
+        return output.replace('{context}', context)
+    root, ext = os.path.splitext(output)
+    return f"{root}-{context}{ext}"
+
+
+def run_all_contexts(args, output_dir: str) -> int:
+    """Export every context in the kubeconfig, once per unique cluster. Returns an exit code."""
+    if args.cluster_name or args.region:
+        print("\u274c --all-contexts derives cluster name and region per context; "
+              "do not pass them explicitly", file=sys.stderr)
+        return 1
+    try:
+        cfg = kubeconfig_utils.load_kubeconfig(args.kubeconfig)
+    except kubeconfig_utils.KubeconfigError as e:
+        print(f"\u274c {e}", file=sys.stderr)
+        return 1
+
+    # One export per unique cluster. When several contexts point at the same
+    # cluster (e.g. 'dc2' and an ARN-named context), keep the shortest name.
+    by_cluster = {}
+    skipped = []
+    for name in kubeconfig_utils.list_context_names(cfg):
+        try:
+            ctx = kubeconfig_utils.resolve_context(cfg, name)
+        except kubeconfig_utils.KubeconfigError as e:
+            print(f"\u26a0\ufe0f  Skipping context '{name}': {e}")
+            continue
+        best = by_cluster.get(ctx.cluster)
+        if best is None:
+            by_cluster[ctx.cluster] = name
+        elif len(name) < len(best):
+            skipped.append((best, name))
+            by_cluster[ctx.cluster] = name
+        else:
+            skipped.append((name, best))
+    for dup, kept in skipped:
+        print(f"\u2139\ufe0f  Skipping context '{dup}': same cluster as '{kept}'")
+    plan = list(by_cluster.values())
+
+    print(f"Exporting {len(plan)} cluster(s) from {len(kubeconfig_utils.list_context_names(cfg))} context(s): "
+          f"{', '.join(plan)}")
+    failures = {}
+    outputs = []
+    for name in plan:
+        print("\n" + "#" * 70 + f"\n# Context: {name}\n" + "#" * 70)
+        out = output_path_for_context(args.output, name)
+        try:
+            run_export(args, name, out, output_dir)
+            outputs.append(out)
+        except Exception as e:  # keep going; report at the end
+            failures[name] = str(e)
+            print(f"\u274c Context '{name}' failed: {e}", file=sys.stderr)
+
+    print("\n" + "=" * 70)
+    print(f"Completed {len(outputs)}/{len(plan)} context(s)")
+    for out in outputs:
+        print(f"  \u2705 {out}")
+    for name, err in failures.items():
+        print(f"  \u274c {name}: {err}")
+    return 1 if failures else 0
+
+
+def run_export(args, context: str, output: str, output_dir: str) -> None:
+    """Export one cluster (the given kubeconfig context) to `output`. Raises on failure."""
+    exporter = EKSConfigExporter(
+        cluster_name=args.cluster_name,
+        region=args.region,
+        kubeconfig=args.kubeconfig,
+        context=context,
+        skip_aws=args.skip_aws
+    )
+    
+    print(f"Exporting EKS cluster '{exporter.cluster_name}' (region {exporter.region}, "
+          f"context {exporter.export_data['metadata']['kube_context'] or 'default'})...")
+    if args.include_aws_resources:
+        print("- Including AWS-specific resources (ENIConfigs, SecurityGroupPolicies, etc.)")
+    if args.include_custom_crds:
+        print("- Including custom resource instances")
+    if args.split_by_type:
+        print("- Generating individual YAML files by resource type")
+    
+    exporter.export_all_resources()
+    
+    # Save main export file
+    main_format = args.format if args.output_format == 'json' else args.output_format
+    if main_format == 'both':
+        json_file = output if output.endswith('.json') else output.rsplit('.', 1)[0] + '.json'
+        yaml_file = output.rsplit('.', 1)[0] + '.yaml'
+        exporter.save_to_file(json_file, 'json')
+        exporter.save_to_file(yaml_file, 'yaml')
+        print(f"Export saved to: {json_file} and {yaml_file}")
+    else:
+        exporter.save_to_file(output, main_format)
+        print(f"Export saved to: {output}")
+    
+    # Generate split YAML files if requested
+    yaml_output_dir = None
+    if args.split_by_type or args.generate_restore_scripts:
+        yaml_output_dir = os.path.join(output_dir, f"kubectl-restore-{exporter.cluster_name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        exporter.save_kubernetes_yaml_resources(yaml_output_dir)
+        print(f"Kubernetes YAML resources saved to: {yaml_output_dir}")
+    
+    # Generate summary report
+    if args.summary:
+        summary = exporter.generate_summary_report()
+        print("\n" + "=" * 60)
+        print(summary)
+        print("=" * 60)
+        
+        summary_file = output.rsplit('.', 1)[0] + '_summary.txt'
+        with open(summary_file, 'w') as f:
+            f.write(summary)
+        print(f"Summary report saved to: {summary_file}")
+    
+    # Show resource counts for new resources
+    resources = exporter.export_data.get('resources', {})
+    new_resource_counts = {
+        'ENI Configs': len(resources.get('eni_configs', [])),
+        'Network Attachment Definitions': len(resources.get('network_attachment_definitions', [])),
+        'Security Group Policies': len(resources.get('security_group_policies', [])),
+        'CNI Nodes': len(resources.get('cni_nodes', [])),
+        'Karpenter NodePools': len(resources.get('karpenter_nodepools', [])),
+        'Karpenter NodeClasses': len(resources.get('karpenter_nodeclasses', [])),
+        'Karpenter NodeClaims': len(resources.get('karpenter_nodeclaims', [])),
+        'Additional Custom Resources': len(resources.get('additional_custom_resources', {}))
+    }
+    
+    print("\nEnhanced Resource Summary:")
+    for resource_type, count in new_resource_counts.items():
+        if count > 0:
+            print(f"  {resource_type}: {count}")
+    
+    print(f"\n\u2705 Export completed successfully!")
+    
+    if yaml_output_dir and args.split_by_type:
+        print(f"\n\U0001f680 To restore this cluster configuration:")
+        print(f"   cd {yaml_output_dir}")
+        print(f"   ./restore-cluster.sh --validate-dependencies")
 
 if __name__ == '__main__':
     main()
