@@ -70,3 +70,12 @@ def test_list_contexts_marks_current(exporter_module, kubeconfig, capsys):
     current = [l for l in lines if l.startswith("* ")]
     assert len(current) == 1 and "ch1" in current[0] and "us-east-2" in current[0]
     assert any("broken" in l and "error" in l for l in lines)
+
+
+def test_output_path_for_context_sanitizes_arn_names(exporter_module):
+    f = exporter_module.output_path_for_context
+    arn = "arn:aws:eks:us-east-1:111122223333:cluster/prod"
+    out = f("out/eks-export-all-TS.json", arn)
+    assert out == "out/eks-export-all-TS-arn_aws_eks_us-east-1_111122223333_cluster_prod.json"
+    assert "/" not in out[len("out/"):]
+    assert f("out/{context}.json", arn).count("/") == 1

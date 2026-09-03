@@ -3,6 +3,7 @@
 import json
 import yaml
 import argparse
+import re
 import sys
 import os
 from typing import Dict, List, Any, Optional
@@ -2437,12 +2438,18 @@ def list_contexts(kubeconfig: str) -> int:
     return 0
 
 
+def safe_context_slug(context: str) -> str:
+    """Filesystem-safe form of a context name. ARN-named contexts contain ':' and '/'."""
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', context).strip('_') or 'context'
+
+
 def output_path_for_context(output: str, context: str) -> str:
     """'x.json' + 'fr5' -> 'x-fr5.json'; honours a literal {context} placeholder."""
+    slug = safe_context_slug(context)
     if '{context}' in output:
-        return output.replace('{context}', context)
+        return output.replace('{context}', slug)
     root, ext = os.path.splitext(output)
-    return f"{root}-{context}{ext}"
+    return f"{root}-{slug}{ext}"
 
 
 def run_all_contexts(args, output_dir: str) -> int:
