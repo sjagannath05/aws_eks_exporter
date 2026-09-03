@@ -183,14 +183,16 @@ check_prerequisites() {
 validate_cluster_access() {
     print_info "Validating cluster access..."
 
-    # Only fetch a kubeconfig when none is in play (no -k, no $KUBECONFIG, no ~/.kube/config).
-    # Never touch a kubeconfig the user pointed us at.
-    if [ -z "$KUBECONFIG" ] && [ ! -f "$HOME/.kube/config" ]; then
-        if [ -z "$CLUSTER_NAME" ]; then
+    # Refresh ~/.kube/config for -c CLUSTER_NAME (previous behaviour) unless the user
+    # pointed us at a kubeconfig (-k / $KUBECONFIG) or a context; those are never modified.
+    if [ -z "$KUBECONFIG" ] && [ -z "$KUBE_CONTEXT" ] && [ "$ALL_CONTEXTS" = false ]; then
+        if [ -z "$CLUSTER_NAME" ] && [ ! -f "$HOME/.kube/config" ]; then
             print_error "No kubeconfig found and no cluster name given; pass -c CLUSTER_NAME or -k PATH"
             exit 1
         fi
-        print_info "Updating kubeconfig for cluster: $CLUSTER_NAME"
+    fi
+    if [ -n "$CLUSTER_NAME" ] && [ -z "$KUBECONFIG" ] && [ -z "$KUBE_CONTEXT" ]; then
+        print_info "Updating ~/.kube/config for cluster: $CLUSTER_NAME"
         if [ -n "$REGION" ]; then
             aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
         else
