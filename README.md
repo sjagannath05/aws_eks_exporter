@@ -160,23 +160,55 @@ The tool requires read access to all Kubernetes resources. A cluster-admin role 
 
 ### Quick Start
 
-**Basic export with HTML dashboard**:
+**Export the current kubeconfig context** (cluster name, region and account are derived from it):
 ```bash
-./eks-export-and-visualize.sh -c my-eks-cluster
+export KUBECONFIG=~/.kube/my-clusters.kubeconfig
+./eks-export-and-visualize.sh
 ```
+
+**Export by cluster name** (writes a kubeconfig via `aws eks update-kubeconfig` only if none exists yet):
+```bash
+./eks-export-and-visualize.sh -c my-eks-cluster -r us-west-2
+```
+
+### Multi-Cluster Kubeconfigs
+
+A single kubeconfig with several contexts (for example `ch1`, `dc2`, `fr5`, `sy1`) is fully supported:
+
+```bash
+# See what each context resolves to (current-context marked with *)
+./eks-export-and-visualize.sh -k ~/.kube/sites.kubeconfig --list-contexts
+
+# Export one site
+./eks-export-and-visualize.sh -k ~/.kube/sites.kubeconfig --context fr5
+
+# Export every unique cluster in the file (one JSON + dashboard per context)
+./eks-export-and-visualize.sh -k ~/.kube/sites.kubeconfig --all-contexts
+```
+
+Rules:
+- `--context` selects the kubeconfig context; the EKS cluster name, region and account come from its cluster ARN (or the `aws eks get-token` exec args). Passing `-c`/`-r` values that contradict the context is an error.
+- `--all-contexts` exports each unique cluster once. Contexts pointing at the same cluster are collapsed to the shortest name. Output files get a `-<context>` suffix; one failing context does not stop the rest.
+- The kubeconfig you point at (via `-k` or `$KUBECONFIG`) is never modified.
+- `kubectl describe` output uses the same kubeconfig and context as the API export.
+- If the EKS API lookup fails (wrong region, no permission, no credentials) the export stops with an error instead of producing a file with empty cluster metadata. Use `--skip-aws` to export Kubernetes resources without any EKS API calls.
 
 ### Command Line Options
 
 ```bash
-Usage: ./eks-export-and-visualize.sh -c CLUSTER_NAME [OPTIONS]
+Usage: ./eks-export-and-visualize.sh [-c CLUSTER_NAME] [OPTIONS]
 
-Required:
-  -c, --cluster CLUSTER_NAME    EKS cluster name
+Cluster selection (one of):
+  -c, --cluster CLUSTER_NAME    EKS cluster name (optional when the kubeconfig context identifies it)
+  --context NAME                kubeconfig context to export (default: current-context)
+  --all-contexts                export every unique cluster in the kubeconfig
+  --list-contexts               list kubeconfig contexts with derived EKS identity and exit
 
 Options:
-  -r, --region REGION          AWS region (default: from AWS config)
+  -r, --region REGION          AWS region (default: from kubeconfig context, then AWS config)
   -o, --output OUTPUT_DIR      Output directory (default: exported)
-  -k, --kubeconfig PATH        Path to kubeconfig file
+  -k, --kubeconfig PATH        Path to kubeconfig file (default: $KUBECONFIG, then ~/.kube/config)
+  --skip-aws                   Do not call the EKS API; export Kubernetes resources only
   -f, --format FORMAT          Export format: json or yaml (default: json)
   --no-html                    Skip HTML dashboard generation
   --no-summary                 Skip summary report generation
@@ -209,7 +241,17 @@ Options:
 
 **Export cluster configuration**:
 ```bash
+# Name/region derived from the kubeconfig context
+python3 eks-config-exporter.py --kubeconfig ~/.kube/sites.kubeconfig --context fr5 --output fr5.json --summary
+
+# Explicit name/region (validated against the kubeconfig if it is an EKS context)
 python3 eks-config-exporter.py my-cluster --region us-west-2 --output cluster-export.json --summary
+
+# All contexts; {context} placeholder is optional (default: -<context> suffix)
+python3 eks-config-exporter.py --kubeconfig ~/.kube/sites.kubeconfig --all-contexts --output 'exports/{context}.json'
+
+# Inspect contexts
+python3 eks-config-exporter.py --kubeconfig ~/.kube/sites.kubeconfig --list-contexts
 ```
 
 **Generate HTML dashboard**:
@@ -285,12 +327,18 @@ aws configure
 
 **kubectl Access Error**:
 ```bash
-# Update kubeconfig
-aws eks update-kubeconfig --region us-west-2 --name my-cluster
+# Check which context/cluster the tool will use
+python3 eks-config-exporter.py --list-contexts
 
-# Test access
-kubectl get nodes
+# Test access for that context
+kubectl --context <name> get nodes
+
+# Or fetch a fresh kubeconfig for a cluster
+aws eks update-kubeconfig --region us-west-2 --name my-cluster
 ```
+
+**"EKS API lookup failed" / "does not match kubeconfig context"**:
+The cluster name or region you passed disagrees with the kubeconfig context, or your AWS credentials are for a different account than the one in the cluster ARN. Drop `-c`/`-r` and let them be derived, pick the right `--context`, or use `--skip-aws` to export without EKS metadata.
 
 **Python Dependencies Error**:
 ```bash
@@ -357,6 +405,8 @@ eks-tool/
 ├── eks-config-exporter.py      # Main export script
 ├── eks-visualizer.py           # HTML dashboard generator
 ├── eks-export-and-visualize.sh # Wrapper script
+├── kubeconfig_utils.py         # Kubeconfig parsing: contexts, EKS ARN -> name/region/account
+├── tests/                      # pytest unit tests (python -m pytest tests)
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # This documentation
 └── exported/                   # Output directory (created)
