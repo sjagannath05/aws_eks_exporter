@@ -16,7 +16,11 @@ NC='\033[0m' # No Color
 CLUSTER_NAME=""
 REGION=""
 OUTPUT_DIR="exported"
-KUBECONFIG=""
+KUBECONFIG_PATH=""          # from -k; $KUBECONFIG env is honoured when this is empty
+KUBE_CONTEXT=""
+ALL_CONTEXTS=false
+SKIP_AWS=false
+LIST_CONTEXTS=false
 EXPORT_FORMAT="json"
 GENERATE_HTML=true
 GENERATE_SUMMARY=true
@@ -51,15 +55,22 @@ show_usage() {
     cat << EOF
 EKS Configuration Export and Visualization Tool
 
-Usage: $0 -c CLUSTER_NAME [OPTIONS]
+Usage: $0 [-c CLUSTER_NAME] [OPTIONS]
 
-Required:
-  -c, --cluster CLUSTER_NAME    EKS cluster name
+Cluster selection (one of):
+  -c, --cluster CLUSTER_NAME    EKS cluster name. Optional when a kubeconfig context
+                                points at an EKS cluster: name, region and account are
+                                derived from it. Required to run 'aws eks update-kubeconfig'
+                                when no kubeconfig is available.
+  --context NAME                kubeconfig context to export (default: current-context)
+  --all-contexts                export every unique cluster in the kubeconfig
+  --list-contexts               list kubeconfig contexts with derived EKS identity and exit
 
 Options:
   -r, --region REGION          AWS region (default: from AWS config)
   -o, --output OUTPUT_DIR      Output directory (default: exported)
-  -k, --kubeconfig PATH        Path to kubeconfig file
+  -k, --kubeconfig PATH        Path to kubeconfig file (default: \$KUBECONFIG, then ~/.kube/config)
+  --skip-aws                   Do not call the EKS API; export Kubernetes resources only
   -f, --format FORMAT          Export format: json or yaml (default: json)
   -v, --venv VENV_DIR          Path to virtual environment directory
   --include-aws-resources      Include AWS-specific resources (ENIConfigs, etc.)
@@ -171,9 +182,14 @@ check_prerequisites() {
 # Function to validate cluster access
 validate_cluster_access() {
     print_info "Validating cluster access..."
-    
-    # Update kubeconfig if needed
-    if [ -z "$KUBECONFIG" ]; then
+
+    # Only fetch a kubeconfig when none is in play (no -k, no $KUBECONFIG, no ~/.kube/config).
+    # Never touch a kubeconfig the user pointed us at.
+    if [ -z "$KUBECONFIG" ] && [ ! -f "$HOME/.kube/config" ]; then
+        if [ -z "$CLUSTER_NAME" ]; then
+            print_error "No kubeconfig found and no cluster name given; pass -c CLUSTER_NAME or -k PATH"
+            exit 1
+        fi
         print_info "Updating kubeconfig for cluster: $CLUSTER_NAME"
         if [ -n "$REGION" ]; then
             aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
@@ -181,13 +197,23 @@ validate_cluster_access() {
             aws eks update-kubeconfig --name "$CLUSTER_NAME"
         fi
     fi
-    
-    # Test kubectl access
-    if ! kubectl get nodes &> /dev/null; then
-        print_error "Cannot access cluster. Please check your kubeconfig and cluster permissions"
+
+    if [ "$ALL_CONTEXTS" = true ]; then
+        if [ -z "$(kubectl config get-contexts -o name 2>/dev/null)" ]; then
+            print_error "kubeconfig has no contexts"
+            exit 1
+        fi
+        print_success "Kubeconfig contexts found (access is validated per context during export)"
+        return
+    fi
+
+    local ctx_args=()
+    [ -n "$KUBE_CONTEXT" ] && ctx_args=(--context "$KUBE_CONTEXT")
+    if ! kubectl "${ctx_args[@]}" get nodes &> /dev/null; then
+        print_error "Cannot access cluster${KUBE_CONTEXT:+ (context: $KUBE_CONTEXT)}. Check your kubeconfig and permissions"
         exit 1
     fi
-    
+
     print_success "Cluster access validated"
 }
 
@@ -200,17 +226,38 @@ export_cluster_config() {
     
     # Generate timestamp for unique filenames
     TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-    EXPORT_FILE="$OUTPUT_DIR/eks-export-${CLUSTER_NAME}-${TIMESTAMP}.$EXPORT_FORMAT"
+    if [ "$ALL_CONTEXTS" = true ]; then
+        EXPORT_LABEL="all"
+    else
+        EXPORT_LABEL="${CLUSTER_NAME:-${KUBE_CONTEXT:-cluster}}"
+    fi
+    EXPORT_FILE="$OUTPUT_DIR/eks-export-${EXPORT_LABEL}-${TIMESTAMP}.$EXPORT_FORMAT"
     
     # Build export command
-    EXPORT_CMD="python3 eks-config-exporter.py $CLUSTER_NAME"
+    EXPORT_CMD="python3 eks-config-exporter.py"
+    
+    if [ -n "$CLUSTER_NAME" ]; then
+        EXPORT_CMD="$EXPORT_CMD $CLUSTER_NAME"
+    fi
     
     if [ -n "$REGION" ]; then
         EXPORT_CMD="$EXPORT_CMD --region $REGION"
     fi
     
-    if [ -n "$KUBECONFIG" ]; then
-        EXPORT_CMD="$EXPORT_CMD --kubeconfig $KUBECONFIG"
+    if [ -n "$KUBECONFIG_PATH" ]; then
+        EXPORT_CMD="$EXPORT_CMD --kubeconfig $KUBECONFIG_PATH"
+    fi
+    
+    if [ -n "$KUBE_CONTEXT" ]; then
+        EXPORT_CMD="$EXPORT_CMD --context $KUBE_CONTEXT"
+    fi
+    
+    if [ "$ALL_CONTEXTS" = true ]; then
+        EXPORT_CMD="$EXPORT_CMD --all-contexts"
+    fi
+    
+    if [ "$SKIP_AWS" = true ]; then
+        EXPORT_CMD="$EXPORT_CMD --skip-aws"
     fi
     
     EXPORT_CMD="$EXPORT_CMD --output $EXPORT_FILE --format $EXPORT_FORMAT"
@@ -252,48 +299,58 @@ export_cluster_config() {
     
     # Execute export
     if eval "$EXPORT_CMD"; then
-        print_success "Configuration exported to: $EXPORT_FILE"
-        echo "$EXPORT_FILE" > "$OUTPUT_DIR/.last_export"
+        if [ "$ALL_CONTEXTS" = true ]; then
+            # Python wrote one file per context: eks-export-all-<ts>-<context>.<fmt>
+            ls "$OUTPUT_DIR"/eks-export-"${EXPORT_LABEL}"-"${TIMESTAMP}"-*."$EXPORT_FORMAT" > "$OUTPUT_DIR/.last_export"
+            print_success "Configuration exported: $(wc -l < "$OUTPUT_DIR/.last_export" | tr -d ' ') file(s)"
+        else
+            print_success "Configuration exported to: $EXPORT_FILE"
+            echo "$EXPORT_FILE" > "$OUTPUT_DIR/.last_export"
+        fi
     else
         print_error "Failed to export cluster configuration"
         exit 1
     fi
 }
 
-# Function to generate HTML dashboard
+# Function to generate HTML dashboard (one per export file)
 generate_html_dashboard() {
     if [ "$GENERATE_HTML" = false ]; then
         return
     fi
     
-    print_info "Generating HTML dashboard..."
+    print_info "Generating HTML dashboard(s)..."
     
-    # Get the last export file
-    if [ -f "$OUTPUT_DIR/.last_export" ]; then
-        EXPORT_FILE=$(cat "$OUTPUT_DIR/.last_export")
-    else
+    if [ ! -s "$OUTPUT_DIR/.last_export" ]; then
         print_error "No export file found"
         return
     fi
     
-    # Generate HTML dashboard
-    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-    HTML_FILE="$OUTPUT_DIR/eks-dashboard-${CLUSTER_NAME}-${TIMESTAMP}.html"
+    : > "$OUTPUT_DIR/.last_dashboard"
+    local export_file html_file base
+    while IFS= read -r export_file; do
+        [ -z "$export_file" ] && continue
+        base=$(basename "$export_file")
+        base="${base%.*}"
+        html_file="$OUTPUT_DIR/${base/#eks-export-/eks-dashboard-}.html"
+        if python3 eks-visualizer.py "$export_file" --output "$html_file"; then
+            print_success "HTML dashboard generated: $html_file"
+            echo "$html_file" >> "$OUTPUT_DIR/.last_dashboard"
+        else
+            print_error "Failed to generate HTML dashboard for $export_file"
+        fi
+    done < "$OUTPUT_DIR/.last_export"
     
-    if python3 eks-visualizer.py "$EXPORT_FILE" --output "$HTML_FILE"; then
-        print_success "HTML dashboard generated: $HTML_FILE"
-        echo "$HTML_FILE" > "$OUTPUT_DIR/.last_dashboard"
-        
-        # Try to open in browser (if available)
+    # Open in browser only for a single dashboard; with --all-contexts just list them
+    if [ "$(wc -l < "$OUTPUT_DIR/.last_dashboard" | tr -d ' ')" = "1" ]; then
+        html_file=$(cat "$OUTPUT_DIR/.last_dashboard")
         if command -v open &> /dev/null; then
             print_info "Opening dashboard in browser..."
-            open "$HTML_FILE" || true
+            open "$html_file" || true
         elif command -v xdg-open &> /dev/null; then
             print_info "Opening dashboard in browser..."
-            xdg-open "$HTML_FILE" || true
+            xdg-open "$html_file" || true
         fi
-    else
-        print_error "Failed to generate HTML dashboard"
     fi
 }
 
@@ -302,8 +359,13 @@ show_export_summary() {
     print_success "EKS Export Completed Successfully!"
     echo
     print_info "Export Details:"
-    echo "  Cluster: $CLUSTER_NAME"
-    echo "  Region: ${REGION:-$(aws configure get region)}"
+    if [ "$ALL_CONTEXTS" = true ]; then
+        echo "  Clusters: all contexts in kubeconfig"
+    else
+        echo "  Cluster: ${CLUSTER_NAME:-(derived from kubeconfig context${KUBE_CONTEXT:+ $KUBE_CONTEXT})}"
+        echo "  Region: ${REGION:-(derived from kubeconfig context)}"
+    fi
+    echo "  Kubeconfig: ${KUBECONFIG:-~/.kube/config}"
     echo "  Output Directory: $OUTPUT_DIR"
     echo "  Format: $EXPORT_FORMAT"
     
@@ -326,15 +388,16 @@ show_export_summary() {
     
     echo
     
-    if [ -f "$OUTPUT_DIR/.last_export" ]; then
-        EXPORT_FILE=$(cat "$OUTPUT_DIR/.last_export")
-        echo "  Export File: $EXPORT_FILE"
-        echo "  File Size: $(du -h "$EXPORT_FILE" | cut -f1)"
+    if [ -s "$OUTPUT_DIR/.last_export" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && echo "  Export File: $f ($(du -h "$f" | cut -f1))"
+        done < "$OUTPUT_DIR/.last_export"
     fi
     
-    if [ -f "$OUTPUT_DIR/.last_dashboard" ]; then
-        HTML_FILE=$(cat "$OUTPUT_DIR/.last_dashboard")
-        echo "  HTML Dashboard: $HTML_FILE"
+    if [ -s "$OUTPUT_DIR/.last_dashboard" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && echo "  HTML Dashboard: $f"
+        done < "$OUTPUT_DIR/.last_dashboard"
     fi
     
     echo
@@ -382,8 +445,24 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -k|--kubeconfig)
-            KUBECONFIG="$2"
+            KUBECONFIG_PATH="$2"
             shift 2
+            ;;
+        --context)
+            KUBE_CONTEXT="$2"
+            shift 2
+            ;;
+        --all-contexts)
+            ALL_CONTEXTS=true
+            shift
+            ;;
+        --list-contexts)
+            LIST_CONTEXTS=true
+            shift
+            ;;
+        --skip-aws)
+            SKIP_AWS=true
+            shift
             ;;
         -f|--format)
             EXPORT_FORMAT="$2"
@@ -441,10 +520,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate required arguments
-if [ -z "$CLUSTER_NAME" ]; then
-    print_error "Cluster name is required"
-    show_usage
+# Make an explicit -k visible to kubectl, aws and python alike.
+if [ -n "$KUBECONFIG_PATH" ]; then
+    if [ ! -f "$KUBECONFIG_PATH" ]; then
+        print_error "Kubeconfig file not found: $KUBECONFIG_PATH"
+        exit 1
+    fi
+    export KUBECONFIG="$KUBECONFIG_PATH"
+fi
+
+if [ "$ALL_CONTEXTS" = true ] && { [ -n "$CLUSTER_NAME" ] || [ -n "$REGION" ] || [ -n "$KUBE_CONTEXT" ]; }; then
+    print_error "--all-contexts derives cluster, region and context per kubeconfig entry; do not combine with -c, -r or --context"
     exit 1
 fi
 
@@ -456,7 +542,16 @@ fi
 
 # Main execution
 main() {
-    print_info "Starting EKS Configuration Export for cluster: $CLUSTER_NAME"
+    if [ "$LIST_CONTEXTS" = true ]; then
+        activate_venv
+        exec python3 eks-config-exporter.py --list-contexts ${KUBECONFIG_PATH:+--kubeconfig "$KUBECONFIG_PATH"}
+    fi
+
+    if [ "$ALL_CONTEXTS" = true ]; then
+        print_info "Starting EKS Configuration Export for all kubeconfig contexts"
+    else
+        print_info "Starting EKS Configuration Export for cluster: ${CLUSTER_NAME:-(from kubeconfig context ${KUBE_CONTEXT:-current})}"
+    fi
     echo
     
     check_prerequisites
