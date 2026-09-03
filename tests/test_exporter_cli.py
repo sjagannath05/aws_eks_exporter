@@ -1,4 +1,5 @@
 import textwrap
+import threading
 import types
 
 import pytest
@@ -137,3 +138,65 @@ def test_skip_aws_allows_non_eks_kubeconfig_without_region(exporter_module, tmp_
     assert e.export_data["cluster_info"] == {}
     with pytest.raises(ValueError, match="pass --region"):
         exporter_module.EKSConfigExporter("anything", kubeconfig=str(kc), skip_aws=False)
+
+
+def _describe_exporter(exporter_module, workers=2):
+    """A no-init exporter with just enough state for describe/resolve tests."""
+    e = exporter_module.EKSConfigExporter.__new__(exporter_module.EKSConfigExporter)
+    e.logger = exporter_module.logging.getLogger("t")
+    e.describe_workers = workers
+    e._describe_executor = exporter_module.ThreadPoolExecutor(max_workers=workers)
+    e.export_data = {"resources": {}}
+    return e
+
+
+def test_describe_async_returns_future_immediately(exporter_module, monkeypatch):
+    e = _describe_exporter(exporter_module)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_describe(resource_type, name, namespace=None):
+        started.set()
+        release.wait(timeout=5)
+        return f"described-{name}"
+
+    monkeypatch.setattr(e, "_get_kubectl_describe", slow_describe)
+    fut = e._get_kubectl_describe_async("pod", "p1", "ns1")
+    assert started.wait(timeout=2)          # the call actually started
+    assert not fut.done()                    # but the caller was not blocked on it
+    release.set()
+    assert fut.result(timeout=5) == "described-p1"
+
+
+def test_resolve_pending_describes_fills_in_results_and_shuts_down(exporter_module, monkeypatch):
+    e = _describe_exporter(exporter_module, workers=4)
+    monkeypatch.setattr(e, "_get_kubectl_describe", lambda t, n, ns=None: f"out-{n}")
+    e.export_data["resources"]["pods"] = [
+        {"name": f"p{i}", "describe_info": e._get_kubectl_describe_async("pod", f"p{i}")} for i in range(6)
+    ]
+    e.resolve_pending_describes()
+    assert [p["describe_info"] for p in e.export_data["resources"]["pods"]] == [f"out-p{i}" for i in range(6)]
+    assert e._describe_executor._shutdown is True
+
+
+def test_resolve_pending_describes_noop_when_nothing_submitted(exporter_module):
+    e = _describe_exporter(exporter_module)
+    e.export_data["resources"]["pods"] = [{"name": "p1", "describe_info": "static-not-a-future"}]
+    e.resolve_pending_describes()  # must not raise, must not touch the executor
+    assert e.export_data["resources"]["pods"][0]["describe_info"] == "static-not-a-future"
+
+
+def test_describe_workers_clamped_to_at_least_one(exporter_module, tmp_path):
+    kc = tmp_path / "plain.yaml"
+    kc.write_text(textwrap.dedent("""
+        apiVersion: v1
+        kind: Config
+        current-context: plain
+        clusters: [{name: plain, cluster: {server: https://127.0.0.1:1}}]
+        contexts: [{name: plain, context: {cluster: plain, user: u}}]
+        users: [{name: u, user: {token: x}}]
+    """))
+    e = exporter_module.EKSConfigExporter("x", kubeconfig=str(kc), skip_aws=True, describe_workers=0)
+    assert e.describe_workers == 1
+    assert e.export_data["metadata"]["describe_workers"] == 1
+    e._describe_executor.shutdown(wait=True)

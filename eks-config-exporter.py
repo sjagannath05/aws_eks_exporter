@@ -14,6 +14,10 @@ import boto3
 from botocore.config import Config as BotoConfig
 import kubeconfig_utils
 import ratelimit
+import future_utils
+from concurrent.futures import ThreadPoolExecutor
+
+DEFAULT_DESCRIBE_WORKERS = 8
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 import logging
@@ -32,7 +36,8 @@ class EKSConfigExporter:
     
     def __init__(self, cluster_name: str = None, region: str = None, kubeconfig: str = None,
                  context: str = None, skip_aws: bool = False,
-                 qps: float = ratelimit.DEFAULT_QPS, burst: int = ratelimit.DEFAULT_BURST):
+                 qps: float = ratelimit.DEFAULT_QPS, burst: int = ratelimit.DEFAULT_BURST,
+                 describe_workers: int = DEFAULT_DESCRIBE_WORKERS):
         self.logger = logging.getLogger(__name__)
         logging.basicConfig(level=logging.INFO)
 
@@ -42,6 +47,13 @@ class EKSConfigExporter:
         # One bucket shared by the Python client and kubectl describe so the
         # API server sees a single bounded stream. qps/burst <= 0 disables it.
         self.rate_limiter = ratelimit.TokenBucket(rate=qps, burst=burst)
+        # kubectl describe is submitted here instead of run inline: each export_*
+        # method returns immediately with a Future in 'describe_info', so describes
+        # for one resource type run while later resource types are still being
+        # listed. resolve_pending_describes() blocks on the results at the end.
+        self.describe_workers = max(1, int(describe_workers))
+        self._describe_executor = ThreadPoolExecutor(
+            max_workers=self.describe_workers, thread_name_prefix="kubectl-describe")
         self.kube_context_info = None   # kubeconfig_utils.ContextInfo or None
         self.kube_identity = None       # kubeconfig_utils.EksIdentity or None
         self._resolve_kube_identity()
@@ -59,6 +71,7 @@ class EKSConfigExporter:
                 'kubeconfig': kubeconfig_utils.kubeconfig_paths(kubeconfig) if (kubeconfig or self.kube_context_info) else None,
                 'aws_metadata': 'skipped' if skip_aws else 'included',
                 'rate_limit': {'qps': qps, 'burst': burst} if self.rate_limiter.enabled else None,
+                'describe_workers': self.describe_workers,
                 'export_timestamp': datetime.now(timezone.utc).isoformat(),
                 'exporter_version': '1.0.0'
             },
@@ -168,6 +181,32 @@ class EKSConfigExporter:
         self.logger.warning(
             f"kubeconfig context '{ctx}' server {kube_host} is not the EKS endpoint {eks_host} "
             f"(tunnel/proxy?). Cannot verify it belongs to cluster '{self.cluster_name}'.")
+
+    def _get_kubectl_describe_async(self, resource_type: str, resource_name: str, namespace: str = None):
+        """Non-blocking version of _get_kubectl_describe(): returns a Future.
+
+        Resolve the whole export_data tree with resolve_pending_describes()
+        before saving; a bare Future is not JSON/YAML serializable.
+        """
+        return self._describe_executor.submit(
+            self._get_kubectl_describe, resource_type, resource_name, namespace)
+
+    def resolve_pending_describes(self):
+        """Block until every submitted kubectl describe call has finished.
+
+        Safe to call even if nothing is pending. Logs progress periodically
+        since this is typically the longest step of a full export.
+        """
+        futures = future_utils.collect_futures(self.export_data['resources'])
+        if not futures:
+            return
+        self.logger.info(f"Waiting on {len(futures)} kubectl describe call(s) "
+                         f"({self.describe_workers} parallel worker(s))...")
+        future_utils.wait_with_progress(
+            futures,
+            on_progress=lambda done, total: self.logger.info(f"kubectl describe: {done}/{total} complete"))
+        self.export_data['resources'] = future_utils.resolve_futures(self.export_data['resources'])
+        self._describe_executor.shutdown(wait=True)
 
     def _kubectl_global_args(self) -> list:
         """Flags so kubectl talks to the same cluster as the Python client."""
@@ -298,7 +337,7 @@ class EKSConfigExporter:
                     'annotations': ns.metadata.annotations or {},
                     'status': ns.status.phase,
                     'creation_timestamp': ns.metadata.creation_timestamp.isoformat() if ns.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('namespace', ns.metadata.name)
+                    'describe_info': self._get_kubectl_describe_async('namespace', ns.metadata.name)
                 })
                 
         except ApiException as e:
@@ -320,7 +359,7 @@ class EKSConfigExporter:
                     'allocatable': node.status.allocatable or {},
                     'node_info': node.status.node_info.to_dict() if node.status.node_info else {},
                     'creation_timestamp': node.metadata.creation_timestamp.isoformat() if node.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('node', node.metadata.name)
+                    'describe_info': self._get_kubectl_describe_async('node', node.metadata.name)
                 }
                 
                 if node.status.conditions:
@@ -358,7 +397,7 @@ class EKSConfigExporter:
                     'volumes': [],
                     'conditions': [],
                     'creation_timestamp': pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('pod', pod.metadata.name, pod.metadata.namespace)
+                    'describe_info': self._get_kubectl_describe_async('pod', pod.metadata.name, pod.metadata.namespace)
                 }
                 
                 # Container information
@@ -432,7 +471,7 @@ class EKSConfigExporter:
                     'ports': [],
                     'selector': service.spec.selector or {},
                     'creation_timestamp': service.metadata.creation_timestamp.isoformat() if service.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('service', service.metadata.name, service.metadata.namespace)
+                    'describe_info': self._get_kubectl_describe_async('service', service.metadata.name, service.metadata.namespace)
                 }
                 
                 if service.spec.ports:
@@ -480,7 +519,7 @@ class EKSConfigExporter:
                     'selector': deployment.spec.selector.match_labels if deployment.spec.selector else {},
                     'strategy': deployment.spec.strategy.type if deployment.spec.strategy else None,
                     'creation_timestamp': deployment.metadata.creation_timestamp.isoformat() if deployment.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('deployment', deployment.metadata.name, deployment.metadata.namespace)
+                    'describe_info': self._get_kubectl_describe_async('deployment', deployment.metadata.name, deployment.metadata.namespace)
                 }
                 
                 self.export_data['resources']['deployments'].append(deployment_info)
@@ -505,7 +544,7 @@ class EKSConfigExporter:
                     'number_ready': ds.status.number_ready or 0,
                     'selector': ds.spec.selector.match_labels if ds.spec.selector else {},
                     'creation_timestamp': ds.metadata.creation_timestamp.isoformat() if ds.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('daemonset', ds.metadata.name, ds.metadata.namespace)
+                    'describe_info': self._get_kubectl_describe_async('daemonset', ds.metadata.name, ds.metadata.namespace)
                 }
                 
                 self.export_data['resources']['daemonsets'].append(ds_info)
@@ -799,7 +838,7 @@ class EKSConfigExporter:
                     'annotations': cm.metadata.annotations or {},
                     'data_keys': list(cm.data.keys()) if cm.data else [],
                     'creation_timestamp': cm.metadata.creation_timestamp.isoformat() if cm.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('configmap', cm.metadata.name, cm.metadata.namespace)
+                    'describe_info': self._get_kubectl_describe_async('configmap', cm.metadata.name, cm.metadata.namespace)
                 }
                 
                 self.export_data['resources']['configmaps'].append(cm_info)
@@ -822,7 +861,7 @@ class EKSConfigExporter:
                     'type': secret.type,
                     'data_keys': list(secret.data.keys()) if secret.data else [],
                     'creation_timestamp': secret.metadata.creation_timestamp.isoformat() if secret.metadata.creation_timestamp else None,
-                    'describe_info': self._get_kubectl_describe('secret', secret.metadata.name, secret.metadata.namespace)
+                    'describe_info': self._get_kubectl_describe_async('secret', secret.metadata.name, secret.metadata.namespace)
                 }
                 
                 self.export_data['resources']['secrets'].append(secret_info)
@@ -1823,6 +1862,7 @@ class EKSConfigExporter:
             except Exception as e:
                 self.logger.error(f"Failed to export {resource_name}: {e}")
         
+        self.resolve_pending_describes()
         if self.rate_limiter.waited_total > 0:
             self.logger.info(f"Rate limiter throttled for {self.rate_limiter.waited_total:.1f}s in total")
         self.logger.info("Resource export completed")
@@ -2417,6 +2457,8 @@ Examples:
                             f'(default: {ratelimit.DEFAULT_QPS:g}; 0 disables)')
     parser.add_argument('--burst', type=int, default=ratelimit.DEFAULT_BURST,
                        help=f'Requests allowed above --qps before throttling (default: {ratelimit.DEFAULT_BURST})')
+    parser.add_argument('--describe-workers', type=int, default=DEFAULT_DESCRIBE_WORKERS,
+                       help=f'Parallel "kubectl describe" calls (default: {DEFAULT_DESCRIBE_WORKERS}; 1 = sequential)')
     parser.add_argument('--skip-aws', action='store_true',
                        help='Do not call the EKS API (cluster/nodegroup metadata); export Kubernetes resources only')
     parser.add_argument('--output', '-o', help='Output file path', 
@@ -2577,7 +2619,8 @@ def run_export(args, context: str, output: str, output_dir: str) -> None:
         context=context,
         skip_aws=args.skip_aws,
         qps=args.qps,
-        burst=args.burst
+        burst=args.burst,
+        describe_workers=args.describe_workers
     )
     
     print(f"Exporting EKS cluster '{exporter.cluster_name}' (region {exporter.region}, "

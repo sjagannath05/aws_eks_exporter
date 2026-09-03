@@ -211,20 +211,22 @@ Options:
   --skip-aws                   Do not call the EKS API; export Kubernetes resources only
   --qps N                      Max Kubernetes API requests/sec incl. kubectl describe (default: 10; 0 disables)
   --burst N                    Requests allowed above --qps before throttling (default: 20)
+  --describe-workers N         Parallel "kubectl describe" calls (default: 8; 1 = sequential)
   -f, --format FORMAT          Export format: json or yaml (default: json)
   --no-html                    Skip HTML dashboard generation
   --no-summary                 Skip summary report generation
   -h, --help                   Show this help message
 ```
 
-### Rate Limiting
+### Rate Limiting and Parallel Describes
 
-The exporter is read-only, but a full run lists ~40 resource types and runs one `kubectl describe` per resource, which on a large cluster means thousands of API requests. A client-side token bucket caps that load:
+The exporter is read-only, but a full run lists ~40 resource types and runs one `kubectl describe` per resource. Each `kubectl describe` costs about 1-2 seconds (process start, TLS handshake, an `aws eks get-token` round trip). On a cluster with hundreds of namespaces and thousands of pods this dominates the run time, so it is parallelized and rate-limited independently:
 
-- **Defaults**: 10 requests/second sustained, burst of 20. One bucket is shared by the Python API client and every `kubectl describe` subprocess.
+- **Parallel describes**: `--describe-workers` (default 8) run `kubectl describe` calls concurrently on a thread pool. Every `export_*` method submits its describes and returns immediately; they resolve once, after every resource type has been listed, so describes for one resource type overlap with API calls and describes for every other resource type. Progress is logged every couple of seconds (`kubectl describe: 120/450 complete`) instead of going silent for minutes. On a namespace-heavy cluster this typically cuts wall-clock time by 5-10x; raise it further (`--describe-workers 16`) on a fast link, or set `--describe-workers 1` to go back to one at a time (e.g. while debugging).
+- **Rate limiting**: a client-side token bucket, 10 requests/second sustained with a burst of 20 by default, shared by every Kubernetes API call and every `kubectl describe`. This is what keeps a higher `--describe-workers` from turning into a request flood against the API server.
 - **429 handling**: if the API server throttles anyway, the call is retried up to 5 times, honouring `Retry-After` (exponential backoff otherwise).
 - **AWS side**: the EKS client uses botocore's adaptive retry mode, which backs off automatically on `ThrottlingException`.
-- **Tuning**: `--qps 5 --burst 10` for a busy production API server; `--qps 0` disables limiting for a lab cluster. The applied values are recorded under `metadata.rate_limit` in the export, and the total time spent throttled is logged at the end.
+- **Tuning**: `--qps 5 --burst 10` for a busy production API server; `--qps 0` disables limiting for a lab cluster. `--describe-workers` and `--qps` interact: with enough workers the token bucket becomes the real throttle, so raise `--qps` alongside `--describe-workers` if you want more real concurrency rather than workers waiting on tokens. Applied values are recorded under `metadata.rate_limit` and `metadata.describe_workers` in the export, and total throttled time is logged at the end.
 
 Note that each `kubectl describe` consumes one token but internally issues a few requests (object, events), so the true API-server rate is somewhat above `--qps` during the describe phase.
 
@@ -420,6 +422,7 @@ eks-tool/
 ├── eks-export-and-visualize.sh # Wrapper script
 ├── kubeconfig_utils.py         # Kubeconfig parsing: contexts, EKS ARN -> name/region/account
 ├── ratelimit.py                # Token bucket + 429 retry proxy for API calls
+├── future_utils.py             # Resolve/wait helpers for async kubectl describe futures
 ├── tests/                      # pytest unit tests (python -m pytest tests)
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # This documentation

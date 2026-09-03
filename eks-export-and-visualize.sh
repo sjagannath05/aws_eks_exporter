@@ -22,6 +22,7 @@ ALL_CONTEXTS=false
 SKIP_AWS=false
 QPS=""
 BURST=""
+DESCRIBE_WORKERS=""
 LIST_CONTEXTS=false
 EXPORT_FORMAT="json"
 GENERATE_HTML=true
@@ -75,6 +76,7 @@ Options:
   --skip-aws                   Do not call the EKS API; export Kubernetes resources only
   --qps N                      Max Kubernetes API requests/sec incl. kubectl describe (default: 10; 0 disables)
   --burst N                    Requests allowed above --qps before throttling (default: 20)
+  --describe-workers N         Parallel "kubectl describe" calls (default: 8; 1 = sequential)
   -f, --format FORMAT          Export format: json or yaml (default: json)
   -v, --venv VENV_DIR          Path to virtual environment directory
   --include-aws-resources      Include AWS-specific resources (ENIConfigs, etc.)
@@ -272,6 +274,10 @@ export_cluster_config() {
     
     if [ -n "$BURST" ]; then
         EXPORT_CMD="$EXPORT_CMD --burst $BURST"
+    fi
+    
+    if [ -n "$DESCRIBE_WORKERS" ]; then
+        EXPORT_CMD="$EXPORT_CMD --describe-workers $DESCRIBE_WORKERS"
     fi
     
     EXPORT_CMD="$EXPORT_CMD --output $EXPORT_FILE --format $EXPORT_FORMAT"
@@ -484,6 +490,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --burst)
             BURST="$2"
+            shift 2
+            ;;
+        --describe-workers)
+            DESCRIBE_WORKERS="$2"
             shift 2
             ;;
         -f|--format)
