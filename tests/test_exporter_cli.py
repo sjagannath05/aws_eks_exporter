@@ -79,3 +79,61 @@ def test_output_path_for_context_sanitizes_arn_names(exporter_module):
     assert out == "out/eks-export-all-TS-arn_aws_eks_us-east-1_111122223333_cluster_prod.json"
     assert "/" not in out[len("out/"):]
     assert f("out/{context}.json", arn).count("/") == 1
+
+
+class _Ctx:
+    def __init__(self, name, server):
+        self.name, self.server = name, server
+
+
+def _bare_exporter(exporter_module, ctx, cluster_name="prod", region="us-east-1", skip_aws=False):
+    e = exporter_module.EKSConfigExporter.__new__(exporter_module.EKSConfigExporter)
+    e.logger = exporter_module.logging.getLogger("t")
+    e.kube_context_info = ctx
+    e.cluster_name, e.region, e.skip_aws = cluster_name, region, skip_aws
+    return e
+
+
+def test_verify_kube_endpoint_matches(exporter_module):
+    e = _bare_exporter(exporter_module, _Ctx("c", "https://ABC.gr7.us-east-1.eks.amazonaws.com"))
+    e._verify_kube_endpoint("https://abc.gr7.us-east-1.eks.amazonaws.com")  # case-insensitive, no raise
+
+
+def test_verify_kube_endpoint_other_eks_cluster_is_fatal(exporter_module):
+    e = _bare_exporter(exporter_module, _Ctx("c", "https://AAA.gr7.us-east-1.eks.amazonaws.com"))
+    with pytest.raises(exporter_module.ExportError, match="wrong cluster"):
+        e._verify_kube_endpoint("https://BBB.gr7.us-east-1.eks.amazonaws.com")
+
+
+def test_verify_kube_endpoint_tunnel_only_warns(exporter_module, caplog):
+    e = _bare_exporter(exporter_module, _Ctx("tunnel", "https://127.0.0.1:6443"))
+    with caplog.at_level("WARNING", logger="t"):
+        e._verify_kube_endpoint("https://BBB.gr7.us-east-1.eks.amazonaws.com")
+    assert "Cannot verify" in caplog.text
+
+
+def test_verify_kube_endpoint_no_context_is_noop(exporter_module):
+    e = _bare_exporter(exporter_module, None)
+    e._verify_kube_endpoint("https://BBB.gr7.us-east-1.eks.amazonaws.com")
+
+
+def test_skip_aws_allows_non_eks_kubeconfig_without_region(exporter_module, tmp_path, monkeypatch):
+    kc = tmp_path / "plain.yaml"
+    kc.write_text(textwrap.dedent("""
+        apiVersion: v1
+        kind: Config
+        current-context: plain
+        clusters: [{name: plain, cluster: {server: https://127.0.0.1:1}}]
+        contexts: [{name: plain, context: {cluster: plain, user: u}}]
+        users: [{name: u, user: {token: x}}]
+    """))
+    for var in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(exporter_module.boto3.session, "Session",
+                        lambda *a, **k: types.SimpleNamespace(region_name=None))
+    e = exporter_module.EKSConfigExporter("anything", kubeconfig=str(kc), skip_aws=True)
+    assert e.region is None and e.aws_client is None
+    e.export_cluster_info()
+    assert e.export_data["cluster_info"] == {}
+    with pytest.raises(ValueError, match="pass --region"):
+        exporter_module.EKSConfigExporter("anything", kubeconfig=str(kc), skip_aws=False)

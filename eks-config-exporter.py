@@ -4,6 +4,7 @@ import json
 import yaml
 import argparse
 import re
+from urllib.parse import urlparse
 import sys
 import os
 from typing import Dict, List, Any, Optional
@@ -130,8 +131,35 @@ class EKSConfigExporter:
                     or os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION')
                     or boto3.session.Session().region_name)
         if not resolved:
+            if self.skip_aws:
+                return None
             raise ValueError("AWS region not given, not derivable from kubeconfig, and not set in AWS config; pass --region")
         return resolved
+
+    def _verify_kube_endpoint(self, eks_endpoint: str):
+        """Make sure the kubeconfig context really points at the EKS cluster we described.
+
+        Needed when the context is not ARN-named (so no identity could be derived)
+        and the user passed the cluster name by hand. A direct EKS endpoint that
+        differs is a definite mismatch and fatal; a non-EKS server (SSM tunnel,
+        proxy, localhost) cannot be verified and only warns.
+        """
+        if not eks_endpoint or not self.kube_context_info or not self.kube_context_info.server:
+            return
+        kube_host = urlparse(self.kube_context_info.server).hostname or ''
+        eks_host = urlparse(eks_endpoint).hostname or ''
+        if kube_host.lower() == eks_host.lower():
+            return
+        ctx = self.kube_context_info.name
+        if kube_host.lower().endswith('.eks.amazonaws.com'):
+            raise ExportError(
+                f"kubeconfig context '{ctx}' points at {kube_host} but EKS cluster "
+                f"'{self.cluster_name}' ({self.region}) is served at {eks_host}. "
+                "The Kubernetes resources would be labelled with the wrong cluster; "
+                "pick the right --context or cluster name.")
+        self.logger.warning(
+            f"kubeconfig context '{ctx}' server {kube_host} is not the EKS endpoint {eks_host} "
+            f"(tunnel/proxy?). Cannot verify it belongs to cluster '{self.cluster_name}'.")
 
     def _kubectl_global_args(self) -> list:
         """Flags so kubectl talks to the same cluster as the Python client."""
@@ -145,8 +173,8 @@ class EKSConfigExporter:
     def _init_clients(self):
         """Initialize AWS and Kubernetes clients."""
         try:
-            # AWS client
-            self.aws_client = boto3.client('eks', region_name=self.region)
+            # AWS client (not needed with --skip-aws)
+            self.aws_client = None if self.skip_aws else boto3.client('eks', region_name=self.region)
             
             # Kubernetes client
             if self.kubeconfig or self.context:
@@ -212,6 +240,7 @@ class EKSConfigExporter:
             return
         try:
             cluster_info = self.aws_client.describe_cluster(name=self.cluster_name)
+            self._verify_kube_endpoint(cluster_info['cluster'].get('endpoint'))
             self.export_data['cluster_info'] = cluster_info['cluster']
             
             # Get node groups
@@ -225,6 +254,8 @@ class EKSConfigExporter:
                 )
                 self.export_data['cluster_info']['nodegroups'].append(ng_detail['nodegroup'])
                 
+        except ExportError:
+            raise
         except Exception as e:
             hint = (f"cluster '{self.cluster_name}' in region '{self.region}'"
                     + (f" (kubeconfig says account {self.account_id})" if self.account_id else ""))
